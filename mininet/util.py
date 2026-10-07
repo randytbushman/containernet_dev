@@ -283,17 +283,24 @@ def makeIntfPair( intf1, intf2, addr1=None, addr2=None, node1=None, node2=None,
 
 def retry( retries, delaySecs, fn, *args, **keywords ):
     """Try something several times before giving up.
-       n: number of times to retry
+       retries: number of retries after the first attempt
        delaySecs: wait this long between tries
-       fn: function to call
+       fn: function to call; a truthy return value means success
        args: args to apply to function call"""
-    tries = 0
-    while not fn( *args, **keywords ) and tries < retries:
-        sleep( delaySecs )
-        tries += 1
-    if tries >= retries:
-        error( "*** gave up after %i retries\n" % tries )
-        exit( 1 )
+    for attempt in range( retries + 1 ):
+        if fn( *args, **keywords ):
+            return
+        if attempt < retries:
+            sleep( delaySecs )
+    error( "*** gave up after %i retries\n" % retries )
+    exit( 1 )
+
+def versionTuple( version: str ) -> tuple:
+    """Convert a dotted version string to a comparable tuple of ints.
+       Replaces distutils.version.StrictVersion (removed in Python 3.12).
+       version: e.g. '2.17.9'; each run of digits becomes one component
+       returns: e.g. (2, 17, 9)"""
+    return tuple( int( part ) for part in re.findall( r'\d+', version ) )
 
 def moveIntfNoRetry( intf, dstNode, printError=False ):
     """Move interface to node, without retrying.

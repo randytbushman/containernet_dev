@@ -51,24 +51,34 @@ Future enhancements:
 
 - Create proxy objects for remote nodes (Mininet: Cluster Edition)
 """
+from __future__ import annotations
+
+import copy
 import errno
 import os
 import pty
 import re
+import shlex
 import signal
 import select
+import threading
 import docker
 import json
-from distutils.version import StrictVersion
 from re import findall
 from subprocess import Popen, PIPE, check_output
 from sys import exit  # pylint: disable=redefined-builtin
-from time import sleep
+from time import sleep, time
+from typing import Optional
 
+from mininet.container import ( ImageReference, ShellProfile,
+                                INTERACTIVE_SHELLS )
 from mininet.log import info, error, warn, debug
+from mininet.netexec import ( NetCommandRunner, NodeShellRunner,
+                              NamespaceRunner, joinCommand )
 from mininet.util import ( quietRun, errRun, errFail, moveIntf, isShellBuiltin,
                            numCores, retry, mountCgroups, BaseString, decode,
-                           encode, getincrementaldecoder, Python3, which )
+                           encode, getincrementaldecoder, Python3, which,
+                           versionTuple )
 from mininet.moduledeps import moduleDeps, pathCheck, TUN
 from mininet.link import Link, Intf, TCIntf, OVSIntf
 
@@ -120,6 +130,13 @@ class Node( object ):
         # Incremental decoder for buffered reading
         self.decoder = getincrementaldecoder()
 
+        # Serialises cmd() so several threads (e.g. CLI + a web API) can
+        # safely drive the same node
+        self._cmdLock = threading.RLock()
+
+        # Strategy for ip/tc/ethtool commands (see createNetRunner)
+        self._netRunner: Optional[ NetCommandRunner ] = None
+
         # Start command interpreter shell
         self.master, self.slave = None, None  # pylint
         self.startShell()
@@ -169,7 +186,9 @@ class Node( object ):
         self.stdout = self.stdin
         self.pid = self.shell.pid
         self.pollOut = select.poll()
-        self.pollOut.register( self.stdout )
+        # POLLIN only: the default mask includes POLLOUT, which a tty
+        # always satisfies, so poll() timeouts would never take effect
+        self.pollOut.register( self.stdout, select.POLLIN | select.POLLPRI )
         # Maintain mapping between file descriptors and nodes
         # This is useful for monitoring multiple nodes
         # using select.poll()
@@ -179,15 +198,51 @@ class Node( object ):
         self.lastCmd = None
         self.lastPid = None
         self.readbuf = ''
-        # Wait for prompt
-        while True:
-            data = self.read( 1024 )
-            if data[ -1 ] == chr( 127 ):
-                break
-            self.pollOut.poll()
+        self._waitForPrompt()
         self.waiting = False
         # +m: disable job control notification
         self.cmd( 'unset HISTFILE; stty -echo; set +m' )
+        self._syncShell()
+
+    # Sentinel prompt, optionally followed by terminal control sequences
+    # (BusyBox ash queries the cursor position after its first prompt)
+    _promptRegex = re.compile( r'\x7f(?:\x1b\[[0-9;?]*[A-Za-z])*$' )
+
+    def _waitForPrompt( self, pollMs: int = 100 ) -> None:
+        """Block until the shell prints its sentinel prompt, chr( 127 ).
+           pollMs: interval for checking whether the shell process died
+           raises: RuntimeError if the shell exits before prompting"""
+        output = ''
+        while True:
+            if not self.pollOut.poll( pollMs ):
+                if self.shell.poll() is not None:
+                    raise RuntimeError(
+                        '%s: shell exited (code %s) before prompting: %r'
+                        % ( self.name, self.shell.returncode, output ) )
+                continue
+            output += self.read( 1024 )
+            if self._promptRegex.search( output ):
+                return
+
+    def _syncShell( self, timeoutSec: float = 10.0 ) -> None:
+        """Discard stray start-up output so that the next command's output
+           lines up with its sentinel. Shells with line editing (e.g.
+           BusyBox ash) may print an extra prompt while switching modes.
+           timeoutSec: give up waiting after this many seconds
+           raises: RuntimeError if the shell does not answer"""
+        # The marker is assembled by printf, so an echoed command line
+        # can never match it
+        self.write( "printf '%s-%s\\n' mn-sync done\n" )
+        marker = re.compile( r'mn-sync-done\r?\n' + self._promptRegex.pattern )
+        output, deadline = '', time() + timeoutSec
+        while not marker.search( output ):
+            if time() > deadline or self.shell.poll() is not None:
+                raise RuntimeError( '%s: shell did not synchronise: %r'
+                                    % ( self.name, output ) )
+            if self.pollOut.poll( 100 ):
+                output += self.read( 1024 )
+        self.readbuf = ''
+        self.waiting = False
 
     def mountPrivateDirs( self ):
         "mount private directories"
@@ -405,16 +460,17 @@ class Node( object ):
         verbose = kwargs.get( 'verbose', False )
         log = info if verbose else debug
         log( '*** %s : %s\n' % ( self.name, args ) )
-        if self.shell:
-            self.shell.poll()
-            if self.shell.returncode is not None:
-                print("shell died on ", self.name)
-                self.shell = None
-                self.startShell()
-            self.sendCmd( *args, **kwargs )
-            return self.waitOutput( verbose )
-        else:
-            warn( '(%s exited - ignoring cmd%s)\n' % ( self, args ) )
+        with self._cmdLock:
+            if self.shell:
+                self.shell.poll()
+                if self.shell.returncode is not None:
+                    warn( "shell died on %s - restarting\n" % self.name )
+                    self.shell = None
+                    self.startShell()
+                self.sendCmd( *args, **kwargs )
+                return self.waitOutput( verbose )
+            else:
+                warn( '(%s exited - ignoring cmd%s)\n' % ( self, args ) )
         return None
 
     def cmdPrint( self, *args):
@@ -444,7 +500,9 @@ class Node( object ):
             # popen( cmd, arg1, arg2... )
             cmd = list( args )
         if shell:
-            cmd = [ os.environ[ 'SHELL' ], '-c' ] + [ ' '.join( cmd ) ]
+            # $SHELL is often unset under sudo
+            cmd = ( [ os.environ.get( 'SHELL', '/bin/sh' ), '-c' ] +
+                    [ ' '.join( cmd ) ] )
         # Attach to our namespace  using mnexec -a
         cmd = defaults.pop( 'mncmd' ) + cmd
         popen = self._popen( cmd, **defaults )
@@ -554,31 +612,64 @@ class Node( object ):
                 intf.delete()
                 info( '.' )
 
+    # Network command execution
+
+    def createNetRunner( self ) -> NetCommandRunner:
+        """Create the strategy that executes ip/tc/ethtool for this node.
+           Subclasses (e.g. Docker) override this to run host tools in the
+           node's namespace instead of relying on the node's own binaries."""
+        return NodeShellRunner( self )
+
+    @property
+    def netRunner( self ) -> NetCommandRunner:
+        "Strategy used to run networking commands (created on first use)"
+        if getattr( self, '_netRunner', None ) is None:
+            self._netRunner = self.createNetRunner()
+        return self._netRunner
+
+    def netCmd( self, *args: object ) -> str:
+        """Run a networking command (ip/tc/ethtool) in this node's network
+           namespace. Unlike cmd(), no shell syntax is interpreted.
+           args: command and arguments
+           returns: merged stdout/stderr"""
+        return self.netRunner.run( *args )
+
     # Routing support
 
-    def setARP( self, ip, mac ):
-        """Add an ARP entry.
+    def setARP( self, ip: str, mac: str, intf=None ) -> str:
+        """Add a static neighbour (ARP) entry.
            ip: IP address as string
-           mac: MAC address as string"""
-        result = self.cmd( 'arp', '-s', ip, mac )
-        return result
+           mac: MAC address as string
+           intf: Intf or name; defaults to the interface routing to ip
+           returns: command output"""
+        if intf is None:
+            route = self.netRunner.query( 'ip', 'route', 'get', ip )
+            match = re.search( r'\bdev\s+(\S+)', route )
+            intf = match.group( 1 ) if match else self.defaultIntf()
+        if intf is None:
+            return 'setARP: no interface for %s\n' % ip
+        return self.netCmd( 'ip', 'neigh', 'replace', ip, 'lladdr', mac,
+                            'dev', intf )
 
-    def setHostRoute( self, ip, intf ):
+    def setHostRoute( self, ip: str, intf ) -> str:
         """Add route to host.
            ip: IP address as dotted decimal
-           intf: string, interface name"""
-        return self.cmd( 'route add -host', ip, 'dev', intf )
+           intf: Intf or interface name
+           returns: command output"""
+        return self.netCmd( 'ip', 'route', 'replace', '%s/32' % ip,
+                            'dev', intf )
 
-    def setDefaultRoute( self, intf=None ):
+    def setDefaultRoute( self, intf=None ) -> str:
         """Set the default route to go through intf.
-           intf: Intf or {dev <intfname> via <gw-ip> ...}"""
+           intf: Intf or {dev <intfname> via <gw-ip> ...}
+           returns: command output"""
         # Note setParam won't call us if intf is none
         if isinstance( intf, BaseString ) and ' ' in intf:
             params = intf
         else:
             params = 'dev %s' % intf
-        # Do this in one line in case we're messing with the root namespace
-        self.cmd( 'ip route del default; ip route add default', params )
+        # 'replace' is atomic, so we never lose connectivity in between
+        return self.netCmd( 'ip route replace default', params )
 
     # Convenience and configuration methods
 
@@ -650,8 +741,7 @@ class Node( object ):
         self.setParam( r, 'setMAC', mac=mac )
         self.setParam( r, 'setIP', ip=ip )
         self.setParam( r, 'setDefaultRoute', defaultRoute=defaultRoute )
-        # This should be examined
-        self.cmd( 'ifconfig lo ' + lo )
+        self.netCmd( 'ip', 'link', 'set', 'dev', 'lo', lo )
         return r
 
     def configDefault( self, **moreParams ):
@@ -697,13 +787,13 @@ class Node( object ):
         while clas and not getattr( clas, 'isSetup', True ):
             clas.setup()
             clas.isSetup = True
-            # Make pylint happy
-            clas = getattr( type( clas ), '__base__', None )
+            # Walk up the class hierarchy (not the metaclass hierarchy)
+            clas = clas.__base__
 
     @classmethod
     def setup( cls ):
         "Make sure our class dependencies are available"
-        pathCheck( 'mnexec', 'ifconfig', moduleName='Mininet')
+        pathCheck( 'mnexec', 'ip', moduleName='Mininet')
 
 
 class Host( Node ):
@@ -716,12 +806,65 @@ class Docker ( Host ):
     This part is inspired by:
     http://techandtrains.com/2014/08/21/docker-container-as-mininet-host/
     We use the docker-py client library to control docker.
+
+    Image compatibility: the container only has to provide a POSIX shell.
+    bash is used when present, otherwise sh (dash, BusyBox ash, ...).
+    Interface, address, route and tc configuration is executed with the
+    host's tools inside the container's network namespace, so images do not
+    need iproute2, net-tools or ethtool.
     """
 
-    def __init__(self, name, dimage=None, dcmd=None, build_params={},
-                 **kwargs):
+    #: Name prefix of all Containernet containers ("mn.<name>")
+    dnameprefix = "mn"
+
+    #: Docker client shared by all containers (one connection pool)
+    _sharedClient: Optional[ docker.DockerClient ] = None
+
+    # Defaults for the keyword arguments accepted by __init__
+    _DEFAULTS = { 'cpu_quota': None,
+                  'cpu_period': None,
+                  'cpu_shares': None,
+                  'cpuset_cpus': None,
+                  'mem_limit': None,
+                  'memswap_limit': None,
+                  'environment': {},
+                  'volumes': [],  # use ["/home/user1/:/mnt/vol2:rw"]
+                  'tmpfs': [],  # use ["/home/vol1/:size=3G,uid=1000"]
+                  'network_mode': None,
+                  'publish_all_ports': True,
+                  'port_bindings': {},
+                  'ports': [],
+                  'dns': [],
+                  'ipc_mode': None,
+                  'devices': [],
+                  'cap_add': [ 'net_admin' ],  # needed for network setup
+                  'storage_opt': None,
+                  'sysctls': {},
+                  'shm_size': '64mb',
+                  'cpus': None,
+                  'device_requests': [],
+                  'privileged': False,
+                  }
+
+    def __init__(self, name: str, dimage: Optional[ str ] = None,
+                 dcmd: Optional[ str ] = None,
+                 build_params: Optional[ dict ] = None,
+                 dshell: Optional[ str ] = None, **kwargs):
         """
         Creates a Docker container as Mininet host.
+
+        name: Mininet node name; the container is named "mn.<name>"
+        dimage: image reference, e.g. "ubuntu:trusty" or
+            "registry:5000/team/img@sha256:..."
+        dcmd: main container process (PID 1). Defaults to "/bin/sh", which
+            exists in virtually every image and keeps the container alive
+            (stdin and a tty are attached). The image's ENTRYPOINT/CMD is not
+            run automatically; call start() once the network is configured.
+        build_params: if it contains "path", the image is built first
+            (passed to docker-py's images.build)
+        dshell: control shell to use ("bash" or "sh"); auto-detected
+        privileged: run the container privileged (default False; the
+            net_admin capability is always added)
 
         Resource limitations based on CFS scheduler:
         * cpu.cfs_quota_us: the total available run-time within a period (in microseconds)
@@ -737,44 +880,25 @@ class Docker ( Host ):
         * memswap_limit: Total limit = memory + swap
 
         All resource limits can be updated at runtime! Use:
-        * updateCpuLimits(...)
-        * updateMemoryLimits(...)
+        * updateCpuLimit(...)
+        * updateMemoryLimit(...)
         """
         self.dimage = dimage
-        self.dnameprefix = "mn"
-        self.dcmd = dcmd if dcmd is not None else "/bin/bash"
-        self.dc = None  # pointer to the dict containing 'Id' and 'Warnings' keys of the container
+        self.dcmd = dcmd if dcmd is not None else "/bin/sh"
+        self.dshell = dshell
+        self.shellProfile: Optional[ ShellProfile ] = None
+        self.dc = None  # dict containing 'Id' and 'Warnings' keys of the container
         self.dcinfo = None
-        self.did = None # Id of running container
-        #  let's store our resource limits to have them available through the
-        #  Mininet API later on
-        defaults = { 'cpu_quota': None,
-                     'cpu_period': None,
-                     'cpu_shares': None,
-                     'cpuset_cpus': None,
-                     'mem_limit': None,
-                     'memswap_limit': None,
-                     'environment': {},
-                     'volumes': [],  # use ["/home/user1/:/mnt/vol2:rw"]
-                     'tmpfs': [], # use ["/home/vol1/:size=3G,uid=1000"]
-                     'network_mode': None,
-                     'publish_all_ports': True,
-                     'port_bindings': {},
-                     'ports': [],
-                     'dns': [],
-                     'ipc_mode': None,
-                     'devices': [],
-                     'cap_add': ['net_admin'],  # we need this to allow mininet network setup
-                     'storage_opt': None,
-                     'sysctls': {},
-                     'shm_size': '64mb',
-                     'cpus': None,
-                     'device_requests': []
-                     }
-        defaults.update( kwargs )
+        self.did = None  # Id of running container
+        self._imageConfigCache: dict[ str, dict ] = {}
 
-        if 'net_admin' not in defaults['cap_add']:
-            defaults['cap_add'] += ['net_admin']  # adding net_admin if it's cleared out to allow mininet network setup
+        # Deep copy: containers must never share mutable defaults
+        defaults = copy.deepcopy( self._DEFAULTS )
+        defaults.update( kwargs )
+        # Copy so the caller's list is never mutated
+        defaults[ 'cap_add' ] = list( defaults[ 'cap_add' ] or [] )
+        if 'net_admin' not in defaults[ 'cap_add' ]:
+            defaults[ 'cap_add' ].append( 'net_admin' )  # needed for network setup
 
         # keep resource in a dict for easy update during container lifetime
         self.resources = dict(
@@ -786,13 +910,13 @@ class Docker ( Host ):
             memswap_limit=defaults['memswap_limit']
         )
         self.shm_size = defaults['shm_size']
-        self.nano_cpus = defaults['cpus'] * 1_000_000_000 if defaults['cpus'] else None
+        self.nano_cpus = int( defaults['cpus'] * 1_000_000_000 ) if defaults['cpus'] else None
         self.device_requests = defaults['device_requests']
         self.volumes = defaults['volumes']
         self.tmpfs = defaults['tmpfs']
         self.environment = {} if defaults['environment'] is None else defaults['environment']
-        # setting PS1 at "docker run" may break the python docker api (update_container hangs...)
-        # self.environment.update({"PS1": chr(127)})  # CLI support
+        # setting PS1 at "docker run" may break the python docker api
+        # (update_container hangs...); it is passed to "docker exec" instead
         self.network_mode = defaults['network_mode']
         self.publish_all_ports = defaults['publish_all_ports']
         self.port_bindings = defaults['port_bindings']
@@ -802,26 +926,15 @@ class Docker ( Host ):
         self.cap_add = defaults['cap_add']
         self.sysctls = defaults['sysctls']
         self.storage_opt = defaults['storage_opt']
+        self.privileged = bool( defaults['privileged'] )
 
         # setup docker client
-        # self.dcli = docker.APIClient(base_url='unix://var/run/docker.sock')
-        self.d_client = docker.from_env()
+        self.d_client = self._client()
         self.dcli = self.d_client.api
 
-        _id = None
-        if build_params.get("path", None):
-            if not build_params.get("tag", None):
-                if dimage:
-                    build_params["tag"] = dimage
-            _id, output = self.build(**build_params)
-            dimage = _id
-            self.dimage = _id
-            info("Docker image built: id: {},  {}. Output:\n".format(
-                _id, build_params.get("tag", None)))
-            info(output)
-
-        # pull image if it does not exist
-        self._check_image_exists(dimage, True, _id=None)
+        if build_params and build_params.get( "path" ):
+            self._buildImage( dict( build_params ) )
+        self._ensureImage()
 
         # for DEBUG
         debug("Created docker container object %s\n" % name)
@@ -829,11 +942,65 @@ class Docker ( Host ):
         debug("dcmd: %s\n" % str(self.dcmd))
         info("%s: kwargs %s\n" % (name, str(kwargs)))
 
-        # creats host config for container
-        # see: https://docker-py.readthedocs.io/en/stable/api.html#docker.api.container.ContainerApiMixin.create_host_config
-        hc = self.dcli.create_host_config(
+        if kwargs.get("rm", False):
+            self._removeExistingContainer( name )
+        self._createContainer( name, defaults[ 'ports' ] )
+
+        # call original Node.__init__
+        Host.__init__(self, name, **kwargs)
+
+        # let's initially set our resource limits
+        self.update_resources(**self.resources)
+
+    # Container lifecycle helpers
+
+    @classmethod
+    def _client( cls ) -> docker.DockerClient:
+        """Return the Docker client shared by all Docker nodes."""
+        if cls._sharedClient is None:
+            Docker._sharedClient = docker.from_env()
+        return Docker._sharedClient
+
+    @property
+    def containerName( self ) -> str:
+        "Docker name of this node's container"
+        return "%s.%s" % ( self.dnameprefix, self.name )
+
+    def _buildImage( self, build_params: dict ) -> None:
+        """Build the image and use it for this container.
+           build_params: docker-py images.build() keyword arguments"""
+        if not build_params.get( "tag" ) and self.dimage:
+            build_params[ "tag" ] = self.dimage
+        _id, output = self.build( **build_params )
+        self.dimage = _id
+        info( "Docker image built: id: {},  {}. Output:\n".format(
+            _id, build_params.get( "tag", None ) ) )
+        info( output )
+
+    def _ensureImage( self ) -> None:
+        """Make sure self.dimage exists locally, pulling it if needed.
+           raises: RuntimeError if the image is unavailable"""
+        if not self.dimage:
+            raise ValueError( "Docker node needs an image (dimage=...)" )
+        if not self._check_image_exists( self.dimage, pullImage=True ):
+            raise RuntimeError( "Docker image %s is not available locally "
+                                "and could not be pulled" % self.dimage )
+
+    def _removeExistingContainer( self, name: str ) -> None:
+        """Remove a left-over container that has this node's name.
+           name: Mininet node name"""
+        containerName = "%s.%s" % ( self.dnameprefix, name )
+        try:
+            self.dcli.remove_container( container=containerName, force=True )
+        except docker.errors.NotFound:
+            pass
+
+    def _createHostConfig( self ) -> dict:
+        """Build the docker host config for the container.
+           see: https://docker-py.readthedocs.io/en/stable/api.html#docker.api.container.ContainerApiMixin.create_host_config"""
+        return self.dcli.create_host_config(
             network_mode=self.network_mode,
-            privileged=False,  # no longer need privileged, using net_admin capability instead
+            privileged=self.privileged,
             binds=self.volumes,
             tmpfs=self.tmpfs,
             publish_all_ports=self.publish_all_ports,
@@ -856,15 +1023,10 @@ class Docker ( Host ):
             device_requests=self.device_requests,
         )
 
-        if kwargs.get("rm", False):
-            container_list = self.dcli.containers(all=True)
-            for container in container_list:
-                for container_name in container.get("Names", []):
-                    if "%s.%s" % (self.dnameprefix, name) in container_name:
-                        self.dcli.remove_container(container="%s.%s" % (self.dnameprefix, name), force=True)
-                        break
-
-        # create new docker container
+    def _createContainer( self, name: str, ports: list ) -> None:
+        """Create and start the container.
+           name: Mininet node name
+           ports: container ports to expose"""
         self.dc = self.dcli.create_container(
             name="%s.%s" % (self.dnameprefix, name),
             image=self.dimage,
@@ -874,8 +1036,8 @@ class Docker ( Host ):
             tty=True,  # allocate pseudo tty
             environment=self.environment,
             #network_disabled=True,  # docker stats breaks if we disable the default network
-            host_config=hc,
-            ports=defaults['ports'],
+            host_config=self._createHostConfig(),
+            ports=ports,
             labels=['com.containernet'],
             volumes=[self._get_volume_mount_name(v) for v in self.volumes if self._get_volume_mount_name(v) is not None],
             hostname=name,
@@ -889,97 +1051,100 @@ class Docker ( Host ):
         self.dcinfo = self.dcli.inspect_container(self.dc)
         self.did = self.dcinfo.get("Id")
 
-        # call original Node.__init__
-        Host.__init__(self, name, **kwargs)
-
-        # let's initially set our resource limits
-        self.update_resources(**self.resources)
-
-        self.master = None
-        self.slave = None
-
     def build(self, **kwargs):
+        """Build an image with docker-py.
+           returns: ( image id, build log )"""
         image, output = self.d_client.images.build(**kwargs)
         output_str = parse_build_output(output)
         return image.id, output_str
 
-    def start(self):
-        # Containernet ignores the CMD field of the Dockerfile.
-        # Lets try to load it here and manually execute it once the
-        # container is started and configured by Containernet:
-        cmd_field = self.get_cmd_field(self.dimage)
-        entryp_field = self.get_entrypoint_field(self.dimage)
-        if entryp_field is not None:
-            if cmd_field is None:
-                cmd_field = list()
-            # clean up cmd_field
-            try:
-                cmd_field.remove(u'/bin/sh')
-                cmd_field.remove(u'-c')
-            except ValueError as ex:
-                pass
-            # we just add the entryp. commands to the beginning:
-            cmd_field = entryp_field + cmd_field
-        if cmd_field is not None:
-            cmd_field.append("> /dev/pts/0 2>&1")  # make output available to docker logs
-            cmd_field.append("&")  # put to background (works, but not nice)
-            info("{}: running CMD: {}\n".format(self.name, cmd_field))
-            self.cmd(" ".join(cmd_field))
+    # Image ENTRYPOINT / CMD support
 
-    def get_cmd_field(self, imagename):
+    def _imageConfig( self, imagename: Optional[ str ] = None ) -> dict:
+        """Return (and cache) the 'Config' section of an image.
+           imagename: image reference; defaults to our image"""
+        imagename = imagename or self.dimage
+        if imagename not in self._imageConfigCache:
+            try:
+                imgd = self.dcli.inspect_image( imagename )
+            except docker.errors.APIError as ex:
+                error( "Error during image inspection of {}:{}\n"
+                       .format( imagename, ex ) )
+                return {}
+            self._imageConfigCache[ imagename ] = imgd.get( "Config" ) or {}
+        return self._imageConfigCache[ imagename ]
+
+    def imageStartCommand( self ) -> Optional[ str ]:
+        """Return the image's ENTRYPOINT + CMD as one shell-quoted command,
+           or None if there is nothing to run."""
+        argv = ( ( self.get_entrypoint_field( self.dimage ) or [] ) +
+                 ( self.get_cmd_field( self.dimage ) or [] ) )
+        if not argv:
+            return None
+        return ' '.join( shlex.quote( arg ) for arg in argv )
+
+    def start(self):
+        """Run the image's ENTRYPOINT/CMD in the background.
+           Containernet ignores these fields at container creation so that
+           they run only after the network is configured; call start()
+           once the topology is up."""
+        command = self.imageStartCommand()
+        if command is None:
+            return
+        info( "{}: running CMD: {}\n".format( self.name, command ) )
+        # make output available to docker logs and put it in the background
+        self.cmd( command + " > /dev/pts/0 2>&1 &" )
+
+    def get_cmd_field(self, imagename=None):
         """
         Try to find the original CMD command of the Dockerfile
         by inspecting the Docker image.
-        Returns list from CMD field if it is different from
-        a single /bin/bash command which Containernet executes
-        anyhow.
+        Returns the CMD list, or None if it is empty or only starts an
+        interactive shell (e.g. "/bin/bash" or "/bin/sh"), which
+        Containernet provides anyhow.
         """
-        try:
-            imgd = self.dcli.inspect_image(imagename)
-            cmd = imgd.get("Config", {}).get("Cmd")
-            assert isinstance(cmd, list)
-            # filter the default case: a single "/bin/bash"
-            if "/bin/bash" in cmd and len(cmd) == 1:
-                return None
-            return cmd
-        except BaseException as ex:
-            error("Error during image inspection of {}:{}"
-                  .format(imagename, ex))
-        return None
+        cmd = self._imageConfig( imagename ).get( "Cmd" )
+        if not isinstance( cmd, list ) or not cmd:
+            return None
+        if len( cmd ) == 1 and cmd[ 0 ] in INTERACTIVE_SHELLS:
+            return None
+        return list( cmd )
 
-    def get_entrypoint_field(self, imagename):
+    def get_entrypoint_field(self, imagename=None):
         """
         Try to find the original ENTRYPOINT command of the Dockerfile
         by inspecting the Docker image.
         Returns list or None.
         """
-        try:
-            imgd = self.dcli.inspect_image(imagename)
-            ep = imgd.get("Config", {}).get("Entrypoint")
-            if isinstance(ep, list) and len(ep) < 1:
-                return None
-            return ep
-        except BaseException as ex:
-            error("Error during image inspection of {}:{}"
-                  .format(imagename, ex))
-        return None
+        ep = self._imageConfig( imagename ).get( "Entrypoint" )
+        if not isinstance( ep, list ) or not ep:
+            return None
+        return list( ep )
 
-    # Command support via shell process in namespace
+    # Command support via shell process in the container
+
+    def createNetRunner( self ) -> NetCommandRunner:
+        """Configure networking with host tools inside our namespace, and
+           fall back to the container's shell if nsenter is unusable."""
+        return NamespaceRunner( lambda: self.pid,
+                                fallback=NodeShellRunner( self ) )
+
     def startShell( self, *args, **kwargs ):
         "Start a shell process for running commands"
         if self.shell:
             error( "%s: shell is already running\n" % self.name )
             return
-        # mnexec: (c)lose descriptors, (d)etach from tty,
-        # (p)rint pid, and run in (n)amespace
-        # opts = '-cd' if mnopts is None else mnopts
-        # if self.inNamespace:
-        #     opts += 'n'
-        # bash -i: force interactive
-        # -s: pass $* to shell, and make process easy to find in ps
-        # prompt is set to sentinel chr( 127 )
-        cmd = [ 'docker', 'exec', '-it',  '%s.%s' % ( self.dnameprefix, self.name ), 'env', 'PS1=' + chr( 127 ),
-                'bash', '--norc', '-is', 'mininet:' + self.name ]
+        # Refresh state: the PID changes if the container was restarted
+        self.dcinfo = self.dcli.inspect_container( self.dc )
+        if self.shellProfile is None:
+            self.shellProfile = ShellProfile.detect( self.containerName,
+                                                     self.dshell )
+        # prompt is set to sentinel chr( 127 ); -s labels the process
+        envArgs = []
+        for key, value in self.shellProfile.environment( chr( 127 ) ).items():
+            envArgs += [ '-e', '%s=%s' % ( key, value ) ]
+        cmd = ( [ 'docker', 'exec', '-it' ] + envArgs + [ self.containerName ] +
+                self.shellProfile.argv( 'mininet:' + self.name ) )
         # Spawn a shell subprocess in a pseudo-tty, to disable buffering
         # in the subprocess and insulate it from signals (e.g. SIGINT)
         # received by the parent
@@ -990,7 +1155,9 @@ class Docker ( Host ):
         self.stdout = self.stdin
         self.pid = self._get_pid()
         self.pollOut = select.poll()
-        self.pollOut.register( self.stdout )
+        # POLLIN only: the default mask includes POLLOUT, which a tty
+        # always satisfies, so poll() timeouts would never take effect
+        self.pollOut.register( self.stdout, select.POLLIN | select.POLLPRI )
         # Maintain mapping between file descriptors and nodes
         # This is useful for monitoring multiple nodes
         # using select.poll()
@@ -1000,15 +1167,23 @@ class Docker ( Host ):
         self.lastCmd = None
         self.lastPid = None
         self.readbuf = ''
-        # Wait for prompt
-        while True:
-            data = self.read( 1024 )
-            if data[ -1 ] == chr( 127 ):
-                break
-            self.pollOut.poll()
+        self._waitForPrompt()
         self.waiting = False
         # +m: disable job control notification
         self.cmd( 'unset HISTFILE; stty -echo; set +m' )
+        self._syncShell()
+
+    def _releaseShell( self ) -> None:
+        """Forget a dead shell and close its pseudo-terminal."""
+        if self.stdout is not None:
+            self.outToNode.pop( self.stdout.fileno(), None )
+            self.inToNode.pop( self.stdin.fileno(), None )
+            self.stdin.close()
+        if self.slave is not None:
+            os.close( self.slave )
+        self.shell = self.stdin = self.stdout = None
+        self.master = self.slave = None
+        self.waiting = False
 
     def _get_volume_mount_name(self, volume_str):
         """ Helper to extract mount names from volume specification strings """
@@ -1018,32 +1193,51 @@ class Docker ( Host ):
         return parts[1]
 
     def terminate( self ):
-        """ Stop docker container """
-        if not self._is_container_running():
-            return
+        """Remove the docker container (also if it has already stopped)
+           and release the control shell."""
         try:
             self.dcli.remove_container(self.dc, force=True, v=True)
+        except docker.errors.NotFound:
+            pass
         except docker.errors.APIError as e:
-            warn("Warning: API error during container removal.\n")
+            warn("Warning: API error during container removal: %s\n" % e)
 
         self.cleanup()
 
     def sendCmd( self, *args, **kwargs ):
         """Send a command, followed by a command to echo a sentinel,
-           and return without waiting for the command to complete."""
+           and return without waiting for the command to complete.
+           printPid: print the command's PID (emulated, since mnexec is
+               not available inside containers)"""
         self._check_shell()
         if not self.shell:
             return
+        printPid = kwargs.pop( 'printPid', False )
+        command = joinCommand( args ).rstrip()
+        if command.endswith( '&' ) and self.shellProfile is not None:
+            # Let the shell profile decide how background jobs are started
+            args = ( self.shellProfile.backgroundCommand( command ), )
+        elif printPid:
+            if command and not isShellBuiltin( command ):
+                # print ^A{pid}\n like 'mnexec -p', then become the command
+                wrapper = 'printf "\\001%d\\012" $$; exec ' + command
+                args = ( 'sh -c ' + shlex.quote( wrapper ), )
         Host.sendCmd( self, *args, **kwargs )
 
     def popen( self, *args, **kwargs ):
-        """Return a Popen() object in node's namespace
+        """Return a Popen() object in the container
            args: Popen() args, single list, or string
-           kwargs: Popen() keyword args"""
+           kwargs: Popen() keyword args; shell=True uses the container's
+               shell rather than the host's $SHELL"""
         if not self._is_container_running():
             error( "ERROR: Can't connect to Container \'%s\'' for docker host \'%s\'!\n" % (self.did, self.name) )
-            return
-        mncmd = ["docker", "exec", "-t", "%s.%s" % (self.dnameprefix, self.name)]
+            return None
+        # No tty: keeps stdout and stderr separate and output byte-exact
+        mncmd = [ "docker", "exec", "-i", self.containerName ]
+        if kwargs.pop( 'shell', False ):
+            shellName = self.shellProfile.executable if self.shellProfile else 'sh'
+            mncmd += [ shellName, '-c' ]
+            args = ( [ joinCommand( args ) ], )
         return Host.popen( self, *args, mncmd=mncmd, **kwargs )
 
     def cmd(self, *args, **kwargs ):
@@ -1052,106 +1246,105 @@ class Docker ( Host ):
         verbose = kwargs.get( 'verbose', False )
         log = info if verbose else debug
         log( '*** %s : %s\n' % ( self.name, args ) )
-        self.sendCmd( *args, **kwargs )
-        return self.waitOutput( verbose )
+        with self._cmdLock:
+            self.sendCmd( *args, **kwargs )
+            return self.waitOutput( verbose )
 
     def _get_pid(self):
+        """Return the container's main PID from the last inspection."""
         state = self.dcinfo.get("State", None)
         if state:
             return state.get("Pid", -1)
         return -1
 
     def _check_shell(self):
-        """Verify if shell is alive and
-           try to restart if needed"""
+        """Verify if shell is alive and try to restart if needed.
+           The Docker API is only queried when the shell has died, so the
+           common path costs no round trip to the daemon."""
+        if self.shell is not None and self.shell.poll() is None:
+            return
+        if self.shell is not None:
+            debug("*** Shell died for docker host \'%s\'!\n" % self.name )
+            self._releaseShell()
         if self._is_container_running():
-            if self.shell:
-                self.shell.poll()
-                if self.shell.returncode is not None:
-                    debug("*** Shell died for docker host \'%s\'!\n" % self.name )
-                    self.shell = None
-                    debug("*** Restarting Shell of docker host \'%s\'!\n" % self.name )
-                    self.startShell()
-            else:
-                debug("*** Restarting Shell of docker host \'%s\'!\n" % self.name )
-                self.startShell()
+            debug("*** Restarting Shell of docker host \'%s\'!\n" % self.name )
+            self.startShell()
         else:
             error( "ERROR: Can't connect to Container \'%s\'' for docker host \'%s\'!\n" % (self.did, self.name) )
-            if self.shell:
-                self.shell = None
 
     def _is_container_running(self):
         """Verify if container is alive"""
-        container_list = self.dcli.containers(filters={"id": self.did, "status": "running"})
-        if len(container_list) == 0:
-            return False;
-        return True
+        if self.did is None:
+            return False
+        try:
+            state = self.dcli.inspect_container( self.did ).get( "State", {} )
+        except docker.errors.NotFound:
+            return False
+        return bool( state.get( "Running" ) )
 
     def _check_image_exists(self, imagename=None, pullImage=False, _id=None):
-        # split tag from repository if a tag is specified
-        if imagename:
-            if ":" in imagename:
-                #If two :, then the first is to specify a port. Otherwise, it must be a tag
-                slices = imagename.split(":")
-                repo = ":".join(slices[0:-1])
-                tag = slices[-1]
-            else:
-                repo = imagename
-                tag = "latest"
-        else:
-            repo, tag = "None", "None"
-
-        if self._image_exists(repo, tag, _id):
+        """Return whether an image exists locally, optionally pulling it.
+           imagename: image reference (tag, digest or id)
+           pullImage: try to pull the image if it is missing
+           _id: image id to accept as well (e.g. a freshly built image)"""
+        imagename = imagename or _id
+        if not imagename:
+            return False
+        if self._image_exists( imagename ):
             return True
-
+        if _id and self._image_exists( _id ):
+            return True
         # image not found
         if pullImage:
-            if self._pull_image(repo, tag):
-                info('*** Download of "%s:%s" successful\n' % (repo, tag))
-                return True
+            ref = ImageReference.parse( imagename )
+            if self._pull_image( ref.repository, ref.pullTag ):
+                info('*** Download of "%s" successful\n' % ref)
+                return self._image_exists( imagename )
         # we couldn't find the image
         return False
 
-    def _image_exists(self, repo, tag, _id=None):
+    def _image_exists(self, repo, tag=None, _id=None):
         """
-        Checks if the repo:tag image exists locally
+        Checks if an image exists locally.
+        Accepts "repo" + "tag", or any single reference (name[:tag],
+        name@digest or image id) as repo.
         :return: True if the image exists locally. Else false.
         """
-        debug("Checking if the image exists locally.")
-        images = self.dcli.images()
-        imageTag = "%s:%s" % (repo, tag)
-        for image in images:
-            if image.get("RepoTags", None):
-                if imageTag in image.get("RepoTags", []):
-                    debug("Image '{}' exists.\n".format(imageTag))
-                    return True
-            if image.get("Id", None):
-                debug("; ".join([str(repo), str(tag), str(_id), str(image.get("Id"))]))
-                if image.get("Id") == _id:
-                    return True
+        reference = repo if tag is None else "%s:%s" % ( repo, tag )
+        for candidate in ( reference, _id ):
+            if not candidate:
+                continue
+            try:
+                self.dcli.inspect_image( candidate )
+                debug( "Image '{}' exists.\n".format( candidate ) )
+                return True
+            except docker.errors.ImageNotFound:
+                continue
+            except docker.errors.APIError as ex:
+                debug( "Image lookup of '{}' failed: {}\n".format( candidate, ex ) )
         return False
 
     def _pull_image(self, repository, tag):
         """
+        Pull an image from its registry.
+        :param repository: repository, including registry if any
+        :param tag: tag or digest (never empty: that would pull all tags)
         :return: True if pull was successful. Else false.
         """
+        info('*** Image "%s:%s" not found. Trying to load the image. \n' % (repository, tag))
+        info('*** This can take some minutes...\n')
         try:
-            info('*** Image "%s:%s" not found. Trying to load the image. \n' % (repository, tag))
-            info('*** This can take some minutes...\n')
-
-            message = ""
-            for line in self.dcli.pull(repository, tag, stream=True):
-                # Collect output of the log for enhanced error feedback
-                message = message + json.dumps(json.loads(line), indent=4)
-
-        except BaseException as ex:
-            error('*** error: _pull_image: %s:%s failed.' % (repository, tag)
-                  + message)
-        #if not self._image_exists(repository, tag):
-        #    error('*** error: _pull_image: %s:%s failed.' % (repository, tag)
-        #          + message)
-        #    return False
+            for line in self.dcli.pull(repository, tag=tag, stream=True, decode=True):
+                if 'error' in line:
+                    error('*** error: _pull_image: %s:%s failed: %s\n'
+                          % (repository, tag, line['error']))
+                    return False
+        except docker.errors.APIError as ex:
+            error('*** error: _pull_image: %s:%s failed: %s\n' % (repository, tag, ex))
+            return False
         return True
+
+    # Resource limits
 
     def update_resources(self, **kwargs):
         """
@@ -1167,104 +1360,70 @@ class Docker ( Host ):
            memswap_limit
            kernel_memory
            restart_policy
+        Only the given, non-None values are sent to Docker and recorded in
+        self.resources after Docker accepted them.
         see https://docs.docker.com/engine/reference/commandline/update/
         or API docs: https://docker-py.readthedocs.io/en/stable/api.html#module-docker.api.container
-        :return:
+        :return: True on success (or nothing to do), else False
         """
+        changes = { res: value for res, value in kwargs.items() if value is not None }
+        if not changes:
+            return True
+        info("{1}: update resources {0}\n".format(changes, self.name))
+        try:
+            self.dcli.update_container(self.dc, **changes)
+        except docker.errors.APIError as ex:
+            error("*** error: %s: resource update %s failed: %s\n"
+                  % (self.name, changes, ex))
+            return False
+        self.resources.update(changes)
+        return True
 
-        self.resources.update(kwargs)
-        # filter out None values to avoid errors
-        resources_filtered = {res:self.resources[res] for res in self.resources if self.resources[res] is not None}
-        info("{1}: update resources {0}\n".format(resources_filtered, self.name))
-        self.dcli.update_container(self.dc, **resources_filtered)
-
-
-    def updateCpuLimit(self, cpu_quota=-1, cpu_period=-1, cpu_shares=-1, cores=None):
+    def updateCpuLimit(self, cpu_quota=None, cpu_period=None, cpu_shares=None, cores=None):
         """
-        Update CPU resource limitations.
-        This method allows to update resource limitations at runtime by bypassing the Docker API
-        and directly manipulating the cgroup options.
+        Update CPU resource limitations at runtime via the Docker API
+        (works with cgroup v1 and v2 and any cgroup driver).
+        Only the given values are changed.
         Args:
-            cpu_quota: cfs quota us
-            cpu_period: cfs period us
-            cpu_shares: cpu shares
+            cpu_quota: cfs quota us (-1 removes the limit)
+            cpu_period: cfs period us (negative values are ignored)
+            cpu_shares: cpu shares (negative values are ignored)
             cores: specifies which cores should be accessible for the container e.g. "0-2,16" represents
                 Cores 0, 1, 2, and 16
+        :return: True on success
         """
         # see https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt
-
-        # also negative values can be set for cpu_quota (uncontrained setting)
-        # just check if value is a valid integer
-        if isinstance(cpu_quota, int):
-            self.resources['cpu_quota'] = self.cgroupSet("cfs_quota_us", cpu_quota)
-        if cpu_period >= 0:
-            self.resources['cpu_period'] = self.cgroupSet("cfs_period_us", cpu_period)
-        if cpu_shares >= 0:
-            self.resources['cpu_shares'] = self.cgroupSet("shares", cpu_shares)
+        changes = {}
+        if cpu_quota is not None:
+            changes['cpu_quota'] = cpu_quota
+        if cpu_period is not None and cpu_period >= 0:
+            changes['cpu_period'] = cpu_period
+        if cpu_shares is not None and cpu_shares >= 0:
+            changes['cpu_shares'] = cpu_shares
         if cores:
-            self.dcli.update_container(self.dc, cpuset_cpus=cores)
-            # quota, period ad shares can also be set by this line. Usable for future work.
+            changes['cpuset_cpus'] = cores
+        return self.update_resources(**changes)
 
-    def updateMemoryLimit(self, mem_limit=-1, memswap_limit=-1):
+    def updateMemoryLimit(self, mem_limit=None, memswap_limit=None):
         """
-        Update Memory resource limitations.
-        This method allows to update resource limitations at runtime by bypassing the Docker API
-        and directly manipulating the cgroup options.
+        Update Memory resource limitations at runtime via the Docker API.
+        Only the given values are changed.
 
         Args:
-            mem_limit: memory limit in bytes
-            memswap_limit: swap limit in bytes
-
+            mem_limit: memory limit in bytes (negative values are ignored)
+            memswap_limit: memory + swap limit in bytes (-1 = unlimited swap).
+                Docker rejects a memory change without a swap limit, so if it
+                is omitted the recorded one (or -1) is sent along.
+        :return: True on success
         """
-        # see https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt
-        if mem_limit >= 0:
-            self.resources['mem_limit'] = self.cgroupSet("limit_in_bytes", mem_limit, resource="memory")
-        if memswap_limit >= 0:
-            self.resources['memswap_limit'] = self.cgroupSet("memsw.limit_in_bytes", memswap_limit, resource="memory")
-
-
-    def cgroupSet(self, param, value, resource='cpu'):
-        """
-        Directly manipulate the resource settings of the Docker container's cgrpup.
-        Args:
-            param: parameter to set, e.g., cfs_quota_us
-            value: value to set
-            resource: resource name: cpu
-
-        Returns: value that was set
-
-        """
-        cmd = 'cgset -r %s.%s=%s docker/%s' % (
-            resource, param, value, self.did)
-        debug(cmd + "\n")
-        try:
-            check_output(cmd, shell=True)
-        except:
-            error("Problem writing cgroup setting %r\n" % cmd)
-            return
-        nvalue = int(self.cgroupGet(param, resource))
-        if nvalue != value:
-            error('*** error: cgroupSet: %s set to %s instead of %s\n'
-                  % (param, nvalue, value))
-        return nvalue
-
-    def cgroupGet(self, param, resource='cpu'):
-        """
-        Read cgroup values.
-        Args:
-            param: parameter to read, e.g., cfs_quota_us
-            resource: resource name: cpu / memory
-
-        Returns: value
-
-        """
-        cmd = 'cgget -r %s.%s docker/%s' % (
-            resource, param, self.did)
-        try:
-            return int(check_output(cmd, shell=True).split()[-1])
-        except:
-            error("Problem reading cgroup info: %r\n" % cmd)
-            return -1
+        changes = {}
+        if mem_limit is not None and mem_limit >= 0:
+            changes['mem_limit'] = mem_limit
+            if memswap_limit is None:
+                memswap_limit = self.resources.get('memswap_limit') or -1
+        if memswap_limit is not None:
+            changes['memswap_limit'] = memswap_limit
+        return self.update_resources(**changes)
 
 
 class CPULimitedHost( Host ):
@@ -1710,8 +1869,7 @@ class OVSSwitch( Switch ):
     @classmethod
     def isOldOVS( cls ):
         "Is OVS ersion < 1.10?"
-        return ( StrictVersion( cls.OVSVersion ) <
-                 StrictVersion( '1.10' ) )
+        return versionTuple( cls.OVSVersion ) < ( 1, 10 )
 
     def dpctl( self, *args ):
         "Run ovs-ofctl command"
@@ -1737,14 +1895,14 @@ class OVSSwitch( Switch ):
     def attach( self, intf ):
         "Connect a data port"
         self.vsctl( 'add-port', self.deployed_name, intf )
-        self.cmd( 'ifconfig', intf, 'up' )
+        self.cmd( 'ip link set dev', intf, 'up' )
         self.TCReapply( intf )
 
     def attachInternalIntf(self, intf_name, net):
         """Add an interface of type:internal to the ovs switch
            and add routing entry to host"""
         self.vsctl('add-port', self.deployed_name, intf_name, '--', 'set', ' interface', intf_name, 'type=internal')
-        int_intf = Intf(intf_name, node=self.deployed_name)
+        Intf( intf_name, node=self )
         #self.addIntf(int_intf, moveIntfFn=None)
         self.cmd('ip route add', net, 'dev', intf_name)
 
@@ -2219,9 +2377,12 @@ def NullController( *_args, **_kwargs ):
     return None
 
 
-def parse_build_output(output):
-        output_str = ""
-        for line in output:
-            for item in line.values():
-                output_str += str(item)
-        return output_str
+def parse_build_output(output) -> str:
+    """Flatten docker-py's streamed build log into one string.
+       output: iterable of build log dicts
+       returns: concatenated log text"""
+    output_str = ""
+    for line in output:
+        for item in line.values():
+            output_str += str(item)
+    return output_str

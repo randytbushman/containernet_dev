@@ -514,11 +514,18 @@ class Mininet( object ):
         return links
 
     def configHosts( self ):
-        "Configure a set of hosts."
+        """Configure a set of hosts.
+           An address assigned explicitly to a host's default interface
+           (e.g. addLink( ..., params1={ 'ip': ... } )) takes precedence
+           over the host-level 'ip' that addHost() assigns automatically."""
         for host in self.hosts:
             info( host.name + ' ' )
             intf = host.defaultIntf()
-            if intf:
+            if intf and intf.IP() is not None:
+                # Keep the link-level address and record it on the host
+                host.params[ 'ip' ] = '%s/%s' % ( intf.IP(), intf.prefixLen )
+                host.config( **dict( host.params, ip=None ) )
+            elif intf:
                 host.configDefault()
             else:
                 # Don't configure nonexistent intf
@@ -1035,10 +1042,10 @@ class Mininet( object ):
             if len( connections ) == 0:
                 error( 'src and dst not connected: %s %s\n' % ( src, dst) )
             for srcIntf, dstIntf in connections:
-                result = srcIntf.ifconfig( status )
+                result = srcIntf.set_state( status )
                 if result:
                     error( 'link src status change failed: %s\n' % result )
-                result = dstIntf.ifconfig( status )
+                result = dstIntf.set_state( status )
                 if result:
                     error( 'link dst status change failed: %s\n' % result )
 
@@ -1124,7 +1131,7 @@ class Containernet( Mininet ):
         :return:
         """
         SAPip = SAPSwitch.ip
-        SAPNet = str(ipaddress.IPv4Network(unicode(SAPip), strict=False))
+        SAPNet = str(ipaddress.IPv4Network(str(SAPip), strict=False))
         # due to a bug with python-iptables, removing and finding rules does not succeed when the mininet CLI is running
         # so we use the iptables tool
         # create NAT rule
@@ -1147,7 +1154,7 @@ class Containernet( Mininet ):
     def removeSAPNAT(self, SAPSwitch):
 
         SAPip = SAPSwitch.ip
-        SAPNet = str(ipaddress.IPv4Network(unicode(SAPip), strict=False))
+        SAPNet = str(ipaddress.IPv4Network(str(SAPip), strict=False))
         # due to a bug with python-iptables, removing and finding rules does not succeed when the mininet CLI is running
         # so we use the iptables tool
         rule0_ = "iptables -t nat -D POSTROUTING ! -o {0} -s {1} -j MASQUERADE".format(SAPSwitch.deployed_name, SAPNet)

@@ -473,9 +473,9 @@ class LinkInjector:
 
             elif 'down' in fault_type:
                 if 'add' in tc_cmd:
-                    command = base_command + 'ifconfig ' + device + ' down'
+                    command = base_command + 'ip link set dev ' + device + ' down'
                 elif 'del' in tc_cmd:
-                    command = base_command + 'ifconfig ' + device + ' up'
+                    command = base_command + 'ip link set dev ' + device + ' up'
             else:
                 # in that case for corruption and loss we can use the 'fault_args' to set 100% probability
                 command = base_qdisc_netem_command + fault_type + ' 100%'

@@ -35,7 +35,7 @@ class LinuxBridge( Switch ):
 
     def start( self, _controllers ):
         "Start Linux bridge"
-        self.cmd( 'ifconfig', self, 'down' )
+        self.cmd( 'ip link set dev', self, 'down' )
         self.cmd( 'brctl delbr', self )
         self.cmd( 'brctl addbr', self )
         if self.stp:
@@ -44,12 +44,12 @@ class LinuxBridge( Switch ):
         for i in self.intfList():
             if self.name in i.name:
                 self.cmd( 'brctl addif', self, i )
-        self.cmd( 'ifconfig', self, 'up' )
+        self.cmd( 'ip link set dev', self, 'up' )
 
     def stop( self, deleteIntfs=True ):
         """Stop Linux bridge
            deleteIntfs: delete interfaces? (True)"""
-        self.cmd( 'ifconfig', self, 'down' )
+        self.cmd( 'ip link set dev', self, 'down' )
         self.cmd( 'brctl delbr', self )
         super( LinuxBridge, self ).stop( deleteIntfs )
 

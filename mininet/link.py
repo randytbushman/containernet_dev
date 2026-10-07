@@ -24,11 +24,17 @@ TCIntf: interface with bandwidth limiting and delay via tc
 Link: basic link class for creating veth pairs
 """
 
+from __future__ import annotations
+
 import re
+from typing import Callable, Optional
 
 from mininet.log import info, error, debug
+from mininet.netexec import IfconfigTranslator
 from mininet.util import makeIntfPair
-import mininet.node
+
+# Linux limits interface names to IFNAMSIZ - 1 characters
+MAX_INTF_NAME_LEN = 15
 
 # Make pylint happy:
 # pylint: disable=too-many-arguments
@@ -36,22 +42,35 @@ import mininet.node
 
 class Intf( object ):
 
-    "Basic interface object that can configure itself."
+    """Basic interface object that can configure itself.
+
+       All configuration goes through the owning node's network command
+       runner (node.netCmd), so it works even when a container image ships
+       neither iproute2 nor net-tools."""
+
+    _ipMatchRegex = re.compile( r'\d+\.\d+\.\d+\.\d+' )
+    _macMatchRegex = re.compile( r'..:..:..:..:..:..' )
+    _inetRegex = re.compile( r'\binet (\d+\.\d+\.\d+\.\d+)/(\d+)' )
+    _etherRegex = re.compile(
+        r'link/ether ((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})' )
+    _flagsRegex = re.compile( r'<([^>]*)>' )
 
     def __init__( self, name, node=None, port=None, link=None,
                   mac=None, **params ):
         """name: interface name (e.g. h1-eth0)
            node: owning node (where this intf most likely lives)
            link: parent link if we're part of a link
-           other arguments are passed to config()"""
+           other arguments are passed to config(); new interfaces are
+           brought up unless up=False is given"""
         self.node = node
         self.name = name
         self.link = link
         self.mac = mac
         self.ip, self.prefixLen = None, None
+        self._ifconfigOverride: Optional[ Callable[ ..., str ] ] = None
 
         # if interface is lo, we know the ip is 127.0.0.1.
-        # This saves an ifconfig command per node
+        # This saves a command per node
         if self.name == 'lo':
             self.ip = '127.0.0.1'
             self.prefixLen = 8
@@ -62,6 +81,9 @@ class Intf( object ):
                 node.addIntf( self, port=port, moveIntfFn=moveIntfFn )
             else:
                 node.addIntf( self, port=port )
+        # Only the initial configuration brings the interface up; later
+        # config() calls leave the administrative state untouched.
+        params.setdefault( 'up', True )
         # Save params for future reference
         self.params = params
         self.config( **params )
@@ -70,69 +92,92 @@ class Intf( object ):
         "Run a command in our owning node"
         return self.node.cmd( *args, **kwargs )
 
-    def ifconfig( self, *args ):
-        "Configure ourselves using ifconfig"
-        return self.cmd( 'ifconfig', self.name, *args )
+    def netCmd( self, *args: object ) -> str:
+        """Run a networking command (ip/tc/ethtool) in our node's network
+           namespace using the node's runner strategy.
+           args: command and arguments
+           returns: command output"""
+        return self.node.netCmd( *args )
 
-    def setIP( self, ipstr, prefixLen=None, overwrite=True ):
-        """Set our IP address"""
-        # This is a sign that we should perhaps rethink our prefix
-        # mechanism and/or the way we specify IP addresses
+    def netQuery( self, *args: object ) -> str:
+        """Run a read-only networking command in our node's network
+           namespace without disturbing the node's interactive shell.
+           args: command and arguments
+           returns: command output"""
+        return self.node.netRunner.query( *args )
 
-        # remove all old adresses (to remove side effects)
-        # this is needed after the swtich from "ifconfig" to "ip"
-        if overwrite:
-            self.cmd("ip", "address", "flush", "dev", self.name)
-        # add the new address
+    def ifconfig( self, *args: object ) -> str:
+        """Configure ourselves using ifconfig-style arguments.
+           Arguments are translated to iproute2, so images without
+           net-tools work. If a callable was passed as the 'ifconfig'
+           parameter, it is called as fn( intf, *args ) instead.
+           args: e.g. 'up', 'down', 'hw', 'ether', <mac>
+           returns: command output"""
+        if self._ifconfigOverride is not None:
+            return self._ifconfigOverride( self, *args ) or ''
+        tokens = [ str( arg ) for arg in args ]
+        commands = IfconfigTranslator.translate( self.name, tokens )
+        if commands is None:
+            # Unknown option: defer to a real ifconfig binary
+            return self.netCmd( 'ifconfig', self.name, *tokens )
+        return ''.join( self.netCmd( *argv ) for argv in commands )
+
+    def setIP( self, ipstr: str, prefixLen: Optional[ int ] = None,
+               overwrite: bool = True ) -> str:
+        """Set our IPv4 address.
+           ipstr: address, optionally with '/prefixLen'
+           prefixLen: prefix length if ipstr has none
+           overwrite: remove existing IPv4 addresses first (IPv6,
+                      including the link-local address, is preserved)
+           returns: command output"""
         if '/' in ipstr:
-            self.ip, self.prefixLen = ipstr.split( '/' )
-            return self.cmd('ip', 'address', 'add', ipstr, 'dev', self.name)
+            ip, prefix = ipstr.split( '/', 1 )
+        elif prefixLen is None:
+            raise ValueError( 'No prefix length set for IP address %s'
+                              % ( ipstr, ) )
         else:
-            if prefixLen is None:
-                raise Exception( 'No prefix length set for IP address %s'
-                                 % ( ipstr, ) )
-            self.ip, self.prefixLen = ipstr, prefixLen
-            return self.cmd('ip', 'address', 'add', '%s/%s' % (ipstr, prefixLen), 'dev', self.name)
+            ip, prefix = ipstr, prefixLen
+        self.ip, self.prefixLen = ip, int( prefix )
+        if overwrite:
+            self.netCmd( 'ip', '-4', 'address', 'flush', 'dev', self.name )
+        return self.netCmd( 'ip', 'address', 'add',
+                            '%s/%s' % ( self.ip, self.prefixLen ),
+                            'dev', self.name )
 
-    def setMAC( self, macstr ):
-        """Set the MAC address for an interface.
-           macstr: MAC address as string"""
+    def setMAC( self, macstr: str ) -> str:
+        """Set the MAC address for an interface. The interface is briefly
+           taken down and restored to its previous state.
+           macstr: MAC address as string
+           returns: command output"""
         self.mac = macstr
-        return ( self.ifconfig( 'down' ) +
-                 self.ifconfig( 'hw', 'ether', macstr ) +
-                 self.ifconfig( 'up' ) )
+        wasUp = self.get_state() == 'up'
+        result = self.netCmd( 'ip', 'link', 'set', 'dev', self.name, 'down' )
+        result += self.netCmd( 'ip', 'link', 'set', 'dev', self.name,
+                               'address', macstr )
+        if wasUp:
+            result += self.netCmd( 'ip', 'link', 'set', 'dev', self.name,
+                                   'up' )
+        return result
 
-    _ipMatchRegex = re.compile( r'\d+\.\d+\.\d+\.\d+' )
-    _macMatchRegex = re.compile( r'..:..:..:..:..:..' )
-
-    def updateIP( self ):
-        "Return updated IP address based on ifconfig"
-        # use pexec instead of node.cmd so that we dont read
-        # backgrounded output from the cli.
-        ifconfig, _err, _exitCode = self.node.pexec(
-            'ifconfig %s' % self.name )
-        ips = self._ipMatchRegex.findall( ifconfig )
-        self.ip = ips[ 0 ] if ips else None
+    def updateIP( self ) -> Optional[ str ]:
+        "Return updated IP address based on the kernel's address list"
+        self.updateAddr()
         return self.ip
 
-    def updateMAC( self ):
-        "Return updated MAC address based on ifconfig"
-        ifconfig = self.ifconfig()
-        macs = self._macMatchRegex.findall( ifconfig )
-        self.mac = macs[ 0 ] if macs else None
+    def updateMAC( self ) -> Optional[ str ]:
+        "Return updated MAC address based on the kernel's link info"
+        self.updateAddr()
         return self.mac
 
-    # Instead of updating ip and mac separately,
-    # use one ifconfig call to do it simultaneously.
-    # This saves an ifconfig command, which improves performance.
-
-    def updateAddr( self ):
-        "Return IP address and MAC address based on ifconfig."
-        ifconfig = self.ifconfig()
-        ips = self._ipMatchRegex.findall( ifconfig )
-        macs = self._macMatchRegex.findall( ifconfig )
-        self.ip = ips[ 0 ] if ips else None
-        self.mac = macs[ 0 ] if macs else None
+    def updateAddr( self ) -> tuple:
+        """Return IP address and MAC address using a single query.
+           returns: ( ip, mac ), either may be None"""
+        output = self.netQuery( 'ip', 'address', 'show', 'dev', self.name )
+        inet = self._inetRegex.search( output )
+        ether = self._etherRegex.search( output )
+        self.ip, self.prefixLen = ( ( inet.group( 1 ), int( inet.group( 2 ) ) )
+                                    if inet else ( None, None ) )
+        self.mac = ether.group( 1 ) if ether else None
         return self.ip, self.mac
 
     def IP( self ):
@@ -143,29 +188,50 @@ class Intf( object ):
         "Return MAC address"
         return self.mac
 
-    def isUp( self, setUp=False ):
-        "Return whether interface is up"
+    def get_state( self ) -> str:
+        """Return the administrative state of the interface.
+           returns: 'up' or 'down'"""
+        output = self.netQuery( 'ip', '-o', 'link', 'show', 'dev', self.name )
+        flags = self._flagsRegex.search( output )
+        if flags and 'UP' in flags.group( 1 ).split( ',' ):
+            return 'up'
+        return 'down'
+
+    def set_state( self, state: str ) -> str:
+        """Set the administrative state of the interface.
+           state: 'up' or 'down'
+           returns: command output ('' on success)"""
+        if state not in ( 'up', 'down' ):
+            raise ValueError( "Invalid state %r; expected 'up' or 'down'"
+                              % ( state, ) )
+        return self.ifconfig( state ) or ''
+
+    def isUp( self, setUp: bool = False ) -> bool:
+        """Return whether interface is up.
+           setUp: bring the interface up first"""
         if setUp:
-            cmdOutput = self.ifconfig( 'up' )
-            # no output / command output indicates success
-            if (len(cmdOutput) > 0
-                    and "ifconfig" not in cmdOutput):
+            cmdOutput = self.set_state( 'up' )
+            # no output indicates success
+            if cmdOutput.strip():
                 error( "Error setting %s up: %s " % ( self.name, cmdOutput ) )
                 return False
-            else:
-                return True
-        else:
-            return "UP" in self.ifconfig()
+            return True
+        return self.get_state() == 'up'
 
-    def rename( self, newname ):
-        "Rename interface"
+    def rename( self, newname: str ) -> str:
+        """Rename interface, preserving its administrative state.
+           newname: new interface name (max 15 characters)
+           returns: command output"""
+        wasUp = self.get_state() == 'up'
+        self.netCmd( 'ip', 'link', 'set', 'dev', self.name, 'down' )
+        result = self.netCmd( 'ip', 'link', 'set', 'dev', self.name,
+                              'name', newname )
         if self.node and self.name in self.node.nameToIntf:
             # rename intf in node's nameToIntf
             self.node.nameToIntf[newname] = self.node.nameToIntf.pop(self.name)
-        self.ifconfig( 'down' )
-        result = self.cmd( 'ip link set', self.name, 'name', newname )
         self.name = newname
-        self.ifconfig( 'up' )
+        if wasUp:
+            self.netCmd( 'ip', 'link', 'set', 'dev', self.name, 'up' )
         return result
 
     # The reason why we configure things in this way is so
@@ -194,26 +260,33 @@ class Intf( object ):
         return result
 
     def config( self, mac=None, ip=None, ifconfig=None,
-                up=True, **_params ):
+                up=None, **_params ):
         """Configure Node according to (optional) parameters:
            mac: MAC address
            ip: IP address
-           ifconfig: arbitrary interface configuration
+           ifconfig: ifconfig-style arguments to apply, or a callable
+                     fn( intf, *args ) that replaces ifconfig() for this
+                     interface from now on
+           up: True brings the interface up, None leaves it unchanged
            Subclasses should override this method and call
            the parent class's config(**params)"""
         # If we were overriding this method, we would call
         # the superclass config method here as follows:
         # r = Parent.config( **params )
         r = {}
+        if callable( ifconfig ):
+            self._ifconfigOverride = ifconfig
+            ifconfig = None
         self.setParam( r, 'setMAC', mac=mac )
         self.setParam( r, 'setIP', ip=ip )
-        self.setParam( r, 'isUp', up=up )
+        if up:
+            self.setParam( r, 'isUp', up=up )
         self.setParam( r, 'ifconfig', ifconfig=ifconfig )
         return r
 
     def delete( self ):
         "Delete interface"
-        self.cmd( 'ip link del ' + self.name )
+        self.netCmd( 'ip', 'link', 'del', 'dev', self.name )
         # We used to do this, but it slows us down:
         # if self.node.inNamespace:
         # Link may have been dumped into root NS
@@ -221,17 +294,17 @@ class Intf( object ):
         self.node.delIntf( self )
         self.link = None
 
-        # call detach if we have a OVSSwitch (just to be sure)
-        if isinstance( self.node, mininet.node.OVSSwitch ):
+        # call detach if we have a OVSSwitch (just to be sure);
+        # imported lazily because mininet.node imports this module
+        from mininet.node import OVSSwitch
+        if isinstance( self.node, OVSSwitch ):
             self.node.detach(self)
 
-    def status( self ):
+    def status( self ) -> str:
         "Return intf status as a string"
-        links, _err, _result = self.node.pexec( 'ip link show' )
-        if self.name in links:
-            return "OK"
-        else:
-            return "MISSING"
+        links = self.netQuery( 'ip', '-o', 'link', 'show' )
+        pattern = r'^\d+:\s+%s[@:]' % re.escape( self.name )
+        return "OK" if re.search( pattern, links, re.MULTILINE ) else "MISSING"
 
     def __repr__( self ):
         return '<%s %s>' % ( self.__class__.__name__, self.name )
@@ -249,15 +322,35 @@ class TCIntf( Intf ):
     # For higher data rates, we will probably need to change them.
     bwParamMax = 1000
 
+    _rootQdiscRegex = re.compile( r'qdisc \S+ ([0-9a-f]+): root' )
+
+    # Harmless tc complaints, e.g. when deleting an absent qdisc
+    _ignoredTcErrors = ( 'No such file or directory',
+                         'Cannot delete qdisc with handle of zero' )
+
+    @staticmethod
+    def _number( value: object, name: str ) -> Optional[ float ]:
+        """Normalise a numeric shaping parameter.
+           Accepts numbers or strings such as '10', '1.5' or '1%'.
+           value: parameter value or None
+           name: parameter name for error messages
+           returns: float or None"""
+        if value is None or isinstance( value, ( int, float ) ):
+            return value
+        try:
+            return float( str( value ).strip().rstrip( '%' ) )
+        except ValueError:
+            raise ValueError( 'Invalid %s value: %r' % ( name, value ) )
+
     def bwCmds( self, bw=None, speedup=0, use_hfsc=False, use_tbf=False,
                 latency_ms=None, enable_ecn=False, enable_red=False ):
         "Return tc commands to set bandwidth"
 
         cmds, parent = [], ' root '
 
-        if bw and ( bw < 0 or bw > self.bwParamMax ):
-            error( 'Bandwidth limit', bw, 'is outside supported range 0..%d'
-                   % self.bwParamMax, '- ignoring\n' )
+        if bw is not None and ( bw <= 0 or bw > self.bwParamMax ):
+            error( 'Bandwidth limit', bw, 'is outside supported range '
+                   '(0..%d] - ignoring\n' % self.bwParamMax )
         elif bw is not None:
             # BL: this seems a bit brittle...
             if ( speedup > 0 and
@@ -305,28 +398,39 @@ class TCIntf( Intf ):
                    loss=None, max_queue_size=None ):
         "Internal method: return tc commands for delay and loss"
         cmds = []
-        if loss and ( loss < 0 or loss > 100 ):
-            error( 'Bad loss percentage', loss, '%%\n' )
-        else:
-            # Delay/jitter/loss/max queue size
-            netemargs = '%s%s%s%s' % (
-                'delay %s ' % delay if delay is not None else '',
-                '%s ' % jitter if jitter is not None else '',
-                'loss %.5f ' % loss if (loss is not None and loss > 0) else '',
-                'limit %d' % max_queue_size if max_queue_size is not None
-                else '' )
-            if netemargs:
-                cmds = [ '%s qdisc add dev %s ' + parent +
-                         ' handle 10: netem ' +
-                         netemargs ]
-                parent = ' parent 10:1 '
+        if loss is not None and ( loss < 0 or loss > 100 ):
+            error( 'Bad loss percentage', loss, '%\n' )
+            return cmds, parent
+        if jitter is not None and delay is None:
+            # netem only accepts jitter as a modifier of a delay
+            error( 'Jitter', jitter, 'requires a delay - ignoring jitter\n' )
+            jitter = None
+        # Delay/jitter/loss/max queue size
+        netemargs = '%s%s%s%s' % (
+            'delay %s ' % delay if delay is not None else '',
+            '%s ' % jitter if jitter is not None else '',
+            'loss %.5f ' % loss if (loss is not None and loss > 0) else '',
+            'limit %d' % max_queue_size if max_queue_size is not None
+            else '' )
+        if netemargs:
+            cmds = [ '%s qdisc add dev %s ' + parent +
+                     ' handle 10: netem ' +
+                     netemargs ]
+            parent = ' parent 10:1 '
         return cmds, parent
 
     def tc( self, cmd, tc='tc' ):
         "Execute tc command for our interface"
         c = cmd % (tc, self)  # Add in tc command and our name
         debug(" *** executing command: %s\n" % c)
-        return self.cmd( c )
+        return self.netCmd( c )
+
+    def rootQdiscHandle( self ) -> Optional[ str ]:
+        """Return the handle of the root qdisc, e.g. '5' or '0' for the
+           kernel default (noqueue, pfifo_fast, fq_codel...).
+           returns: handle string or None if it cannot be determined"""
+        match = self._rootQdiscRegex.search( self.tc( '%s qdisc show dev %s' ) )
+        return match.group( 1 ) if match else None
 
     # pylint: disable=arguments-differ
     def config( self, bw=None, delay=None, jitter=None, loss=None,
@@ -335,10 +439,13 @@ class TCIntf( Intf ):
                 latency_ms=None, enable_ecn=False, enable_red=False,
                 max_queue_size=None, **params ):
         """Configure the port and set its properties.
-           bw: bandwidth in b/s (e.g. '10m')
+           Every call fully describes the desired shaping: parameters that
+           are omitted are removed, and a call without any shaping
+           parameters restores the kernel's default qdisc.
+           bw: bandwidth in Mbit/s (e.g. 10)
            delay: transmit delay (e.g. '1ms' )
-           jitter: jitter (e.g. '1ms')
-           loss: loss (e.g. '1%' )
+           jitter: jitter (e.g. '1ms'); requires delay
+           loss: loss percentage (e.g. 1 or '1%' )
            gro: enable GRO (False)
            txo: enable transmit checksum offload (True)
            rxo: enable receive checksum offload (True)
@@ -352,6 +459,8 @@ class TCIntf( Intf ):
 
         # Support old names for parameters
         gro = not params.pop( 'disable_gro', not gro )
+        bw = self._number( bw, 'bw' )
+        loss = self._number( loss, 'loss' )
 
         result = Intf.config( self, **params)
 
@@ -359,24 +468,18 @@ class TCIntf( Intf ):
             "Helper method: bool -> 'on'/'off'"
             return 'on' if isOn else 'off'
 
-        # Set offload parameters with ethool
-        self.cmd( 'ethtool -K', self,
-                  'gro', on( gro ),
-                  'tx', on( txo ),
-                  'rx', on( rxo ) )
+        # Set offload parameters with ethtool (skipped if not installed)
+        if self.node.netRunner.available( 'ethtool' ):
+            self.netCmd( 'ethtool -K', self,
+                         'gro', on( gro ),
+                         'tx', on( txo ),
+                         'rx', on( rxo ) )
 
-        # Optimization: return if nothing else to configure
-        # Question: what happens if we want to reset things?
-        if ( bw is None and not delay and not loss
-             and max_queue_size is None ):
-            return None
-
-        # Clear existing configuration
-        tcoutput = self.tc( '%s qdisc show dev %s' )
-        if "priomap" not in tcoutput and "noqueue" not in tcoutput:
-            cmds = [ '%s qdisc del dev %s root' ]
-        else:
-            cmds = []
+        # Remove any shaping we (or anyone) installed earlier so this call
+        # fully determines the result; default qdiscs have handle 0
+        cmds = []
+        if self.rootQdiscHandle() not in ( None, '0' ):
+            cmds.append( '%s qdisc del dev %s root' )
 
         # Bandwidth limits via various methods
         bwcmds, parent = self.bwCmds( bw=bw, speedup=speedup,
@@ -393,6 +496,10 @@ class TCIntf( Intf ):
                                             parent=parent )
         cmds += delaycmds
 
+        # Optimization: nothing installed and nothing requested
+        if not cmds:
+            return None
+
         # Ugly but functional: display configuration info
         stuff = ( ( [ '%.2fMbit' % bw ] if bw is not None else [] ) +
                   ( [ '%s delay' % delay ] if delay is not None else [] ) +
@@ -406,7 +513,8 @@ class TCIntf( Intf ):
         debug("at map stage w/cmds: %s\n" % cmds)
         tcoutputs = [ self.tc(cmd) for cmd in cmds ]
         for output in tcoutputs:
-            if output != '' and output != 'RTNETLINK answers: No such file or directory\r\n':
+            if output.strip() and not any( msg in output for msg
+                                           in self._ignoredTcErrors ):
                 error( "*** Error: %s" % output )
         debug( "cmds:", cmds, '\n' )
         debug( "outputs:", tcoutputs, '\n' )
@@ -491,10 +599,17 @@ class Link( object ):
         pass
 
     def intfName( self, node, n ):
-        "Construct a canonical interface name node-ethN for interface n."
+        """Construct a canonical interface name node-ethN for interface n.
+           raises: ValueError if the name exceeds the kernel's limit"""
         # Leave this as an instance method for now
         assert self
-        return node.name + '-eth' + repr( n )
+        name = node.name + '-eth' + repr( n )
+        if len( name ) > MAX_INTF_NAME_LEN:
+            raise ValueError(
+                'Interface name %r is longer than %d characters; use a '
+                'shorter node name or pass intfName1/intfName2'
+                % ( name, MAX_INTF_NAME_LEN ) )
+        return name
 
     @classmethod
     def makeIntfPair( cls, intfname1, intfname2, addr1=None, addr2=None,
