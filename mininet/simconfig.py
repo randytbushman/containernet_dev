@@ -105,8 +105,10 @@ nodes: mapping name -> settings, a kind string, or nothing; or a list of
 links: list of "a -- b" strings, [a, b] pairs or mappings with a/b (or
     endpoints: [a, b]). An endpoint is a node name or a mapping with
     node, intf and ip. Link settings: id, cost (routing weight, default 1),
-    state (up|down), delay, jitter, loss, bw, max_queue_size and tc (any
-    other TCIntf.config() options).
+    state (up|down), delay, jitter, loss, bw, max_queue_size and tc (the
+    other TCIntf.config() options). A bare number for delay or jitter means
+    milliseconds. An endpoint may set the shaping keys too: they shape the
+    traffic that end sends, over the link's own.
 
 addressing: p2p_pool / p2p_prefix (router-router links, default
     10.255.0.0/16 split into /30s), lan_pool / lan_prefix (everything else,
@@ -152,10 +154,10 @@ import math
 import re
 import sys
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, ClassVar, Iterable, Iterator, Mapping
 
 from mininet.log import info, warn, setLogLevel
 
@@ -252,6 +254,334 @@ class InferenceLog( object ):
         return '\n'.join( str( note ) for note in self.notes )
 
 
+# Configuration values
+#
+# Settings that configure the simulation's objects. A field left None is not
+# set, so layers (built-in defaults, the file's defaults, the node or link
+# itself) combine field by field with merged(): mappings merge key by key,
+# anything else set in the later layer wins.
+
+def _merged( base: Any, override: Any ) -> Any:
+    """Combine two layers of one setting (see the section comment)."""
+    if override is None:
+        return copy.deepcopy( base )
+    if isinstance( base, dict ) and isinstance( override, dict ):
+        return _deepMerge( base, override )
+    return copy.deepcopy( override )
+
+
+def _mergedFields( base: Any, override: Any ) -> Any:
+    """A dataclass with override's settings layered over base's."""
+    return replace( base, **{ f.name: _merged( getattr( base, f.name ),
+                                               getattr( override, f.name ) )
+                              for f in fields( base ) } )
+
+
+_DURATION = re.compile( r'^(\d+(?:\.\d+)?)\s*(us|ms|s)?$' )
+_TIME_MS = { 'us': 0.001, 'ms': 1.0, 's': 1000.0 }
+
+
+def _duration( value: Any, where: str ) -> str:
+    """A tc duration; a bare number means milliseconds ('40' is '40ms')."""
+    match = _DURATION.match( str( value ).strip() )
+    if not match or isinstance( value, bool ):
+        raise SimConfigError( '%s: %r is not a duration (e.g. 20ms, 250us, '
+                              '1.5s or 40 for milliseconds)' % ( where, value ) )
+    return '%s%s' % ( match.group( 1 ), match.group( 2 ) or 'ms' )
+
+
+def _number( value: Any, where: str, kind: type = float ) -> Any:
+    """A number (int or float); '2%' is 2 for percentages."""
+    try:
+        if isinstance( value, bool ):
+            raise ValueError
+        number = float( str( value ).strip().rstrip( '%' ) )
+        if kind is int:
+            if not number.is_integer():
+                raise ValueError
+            return int( number )
+        return int( number ) if number.is_integer() else number
+    except ValueError:
+        raise SimConfigError( '%s: %r is not %s' % (
+            where, value, 'a whole number' if kind is int else 'a number' ) )
+
+
+def _flag( value: Any, where: str ) -> bool:
+    if not isinstance( value, bool ):
+        raise SimConfigError( '%s: %r is not true or false' % ( where, value ) )
+    return value
+
+
+@dataclass
+class Shaping( object ):
+    """Traffic control of one interface: the options of TCIntf.config()
+       (mininet.link). None means not set, so TCIntf's default applies."""
+
+    #: The options a link or endpoint may set directly; the others go in 'tc'
+    BASIC: ClassVar[ tuple ] = ( 'delay', 'jitter', 'loss', 'bw',
+                                 'max_queue_size' )
+
+    delay: str | None = None            # e.g. '20ms'
+    jitter: str | None = None           # needs a delay
+    loss: float | None = None           # percent
+    bw: float | None = None             # Mbit/s
+    max_queue_size: int | None = None   # packets
+    use_hfsc: bool | None = None
+    use_tbf: bool | None = None
+    latency_ms: float | None = None
+    enable_ecn: bool | None = None
+    enable_red: bool | None = None
+    speedup: float | None = None
+    gro: bool | None = None
+    txo: bool | None = None
+    rxo: bool | None = None
+
+    @classmethod
+    def fromDict( cls, data: Mapping[ str, Any ], where: str ) -> Shaping:
+        """Parse shaping options in configuration form.
+           raises: SimConfigError for unknown options and invalid values"""
+        known = { f.name for f in fields( cls ) }
+        unknown = sorted( set( data ) - known )
+        if unknown:
+            raise SimConfigError( '%s: unknown shaping option(s) %s' % (
+                where, ', '.join( map( str, unknown ) ) ) )
+        values: dict = {}
+        for key, value in data.items():
+            at = '%s.%s' % ( where, key )
+            if value is None:
+                continue
+            if key in ( 'delay', 'jitter' ):
+                values[ key ] = _duration( value, at )
+            elif key in ( 'loss', 'bw', 'latency_ms', 'speedup' ):
+                values[ key ] = _number( value, at )
+            elif key == 'max_queue_size':
+                values[ key ] = _number( value, at, int )
+            else:
+                values[ key ] = _flag( value, at )
+        if values.get( 'loss' ) is not None and not 0 <= values[ 'loss' ] <= 100:
+            raise SimConfigError( '%s.loss: %s%% is not a percentage'
+                                  % ( where, values[ 'loss' ] ) )
+        return cls( **values )
+
+    def merged( self, override: Shaping ) -> Shaping:
+        """This shaping with override's options layered over it."""
+        return _mergedFields( self, override )
+
+    def params( self ) -> dict:
+        """The options that are set, as keyword arguments for TCIntf.config()
+           (and in configuration form)."""
+        return { f.name: getattr( self, f.name ) for f in fields( self )
+                 if getattr( self, f.name ) is not None }
+
+    def toDict( self ) -> dict:
+        """Configuration form: the basic options directly, others under 'tc'."""
+        result: dict = {}
+        for key, value in self.params().items():
+            if key in self.BASIC:
+                result[ key ] = value
+            else:
+                result.setdefault( 'tc', {} )[ key ] = value
+        return result
+
+    def __bool__( self ) -> bool:
+        return bool( self.params() )
+
+    @staticmethod
+    def milliseconds( duration: str | None ) -> float | None:
+        """A duration ('20ms', '250us', '1.5s') in milliseconds."""
+        if duration is None:
+            return None
+        match = _DURATION.match( duration )
+        return float( match.group( 1 ) ) * _TIME_MS[ match.group( 2 ) or 'ms' ]
+
+    def describe( self ) -> str:
+        """Short description for log messages, e.g. 'delay 20ms, loss 1'."""
+        return ', '.join( '%s %s' % item for item in self.params().items() )
+
+
+@dataclass
+class PortBinding( object ):
+    """A container port published on the host."""
+
+    containerPort: int
+    #: None: a free (ephemeral) port
+    hostPort: int | None = None
+
+    @classmethod
+    def parse( cls, value: Any, where: str ) -> PortBinding:
+        """Parse 80 or '8080:80' (host:container)."""
+        text = str( value ).strip()
+        host, _, container = text.rpartition( ':' )
+        try:
+            binding = cls( int( container ), int( host ) if host else None )
+        except ValueError:
+            raise SimConfigError( '%s: %r is not a port (e.g. 80 or '
+                                  '"8080:80")' % ( where, value ) )
+        for port in ( binding.containerPort, binding.hostPort ):
+            if port is not None and not 0 < port < 65536:
+                raise SimConfigError( '%s: port %d is out of range'
+                                      % ( where, port ) )
+        return binding
+
+    def toConfig( self ) -> int | str:
+        """Configuration form: 80, or '8080:80' for a fixed host port."""
+        if self.hostPort is None:
+            return self.containerPort
+        return '%d:%d' % ( self.hostPort, self.containerPort )
+
+
+def _environment( value: Any, where: str ) -> dict[ str, str ]:
+    """Environment variables from a mapping or a list of 'KEY=value'."""
+    if not value:
+        return {}
+    if isinstance( value, dict ):
+        return { str( k ): str( v ) for k, v in value.items() }
+    if isinstance( value, list ):
+        return dict( ( str( item ).split( '=', 1 ) + [ '' ] )[ :2 ]
+                     for item in value )
+    raise SimConfigError( '%s: expected a mapping or a list of KEY=value'
+                          % where )
+
+
+def _strings( value: Any, where: str ) -> list[ str ]:
+    """A list of strings; a single string is a list of one."""
+    if isinstance( value, str ):
+        return [ value ]
+    if not isinstance( value, list ):
+        raise SimConfigError( '%s: expected a list' % where )
+    return [ str( item ) for item in value ]
+
+
+def _mapping( value: Any, where: str ) -> dict:
+    if not isinstance( value, dict ):
+        raise SimConfigError( '%s: expected a mapping' % where )
+    return copy.deepcopy( value )
+
+
+@dataclass
+class NodeOptions( object ):
+    """A node's Docker and switch settings, in configuration vocabulary (see
+       the module documentation). None means not set."""
+
+    #: The settings for containers, and for switches
+    DOCKER: ClassVar[ tuple ] = (
+        'cmd', 'env', 'environment', 'ports', 'volumes', 'privileged',
+        'sysctls', 'cpus', 'mem_limit', 'memswap_limit', 'cpu_shares',
+        'cpu_quota', 'cpu_period', 'cpuset_cpus', 'dns', 'devices', 'cap_add',
+        'shell' )
+    SWITCH: ClassVar[ tuple ] = ( 'dpid', 'protocols', 'fail_mode' )
+
+    cmd: str | None = None
+    #: 'env' and 'environment' are the same setting; they are combined
+    environment: dict[ str, str ] | None = None
+    ports: list[ PortBinding ] | None = None
+    volumes: list[ str ] | None = None
+    privileged: bool | None = None
+    sysctls: dict[ str, Any ] | None = None
+    cpus: float | None = None
+    mem_limit: str | int | None = None
+    memswap_limit: str | int | None = None
+    cpu_shares: int | None = None
+    cpu_quota: int | None = None
+    cpu_period: int | None = None
+    cpuset_cpus: str | None = None
+    dns: list[ str ] | None = None
+    devices: list[ str ] | None = None
+    cap_add: list[ str ] | None = None
+    shell: str | None = None
+    dpid: str | None = None
+    protocols: str | None = None
+    fail_mode: str | None = None
+    #: Raw keyword arguments for addDocker() or addSwitch()
+    params: dict[ str, Any ] | None = None
+
+    @classmethod
+    def fromDict( cls, data: Mapping[ str, Any ], where: str ) -> NodeOptions:
+        """Parse the Docker/switch settings among a node's settings (other
+           keys are left to the caller).
+           raises: SimConfigError for invalid values"""
+        options = cls()
+        if 'env' in data or 'environment' in data:
+            options.environment = {
+                **_environment( data.get( 'env' ), where + '.env' ),
+                **_environment( data.get( 'environment' ),
+                                where + '.environment' ) }
+        for key, value in data.items():
+            at = '%s.%s' % ( where, key )
+            if value is None or key in ( 'env', 'environment' ):
+                continue
+            if key == 'ports':
+                ports = value if isinstance( value, list ) else [ value ]
+                options.ports = [ PortBinding.parse( port, at )
+                                  for port in ports ]
+            elif key in ( 'volumes', 'dns', 'devices', 'cap_add' ):
+                setattr( options, key, _strings( value, at ) )
+            elif key in ( 'sysctls', 'params' ):
+                setattr( options, key, _mapping( value, at ) )
+            elif key == 'privileged':
+                options.privileged = _flag( value, at )
+            elif key == 'cpus':
+                options.cpus = _number( value, at )
+            elif key in ( 'cpu_shares', 'cpu_quota', 'cpu_period' ):
+                setattr( options, key, _number( value, at, int ) )
+            elif key == 'fail_mode':
+                if value not in ( 'secure', 'standalone' ):
+                    raise SimConfigError( "%s: must be 'secure' or "
+                                          "'standalone'" % at )
+                options.fail_mode = value
+            elif key in ( 'mem_limit', 'memswap_limit' ):
+                # Bytes, or Docker's size strings such as '256m'
+                setattr( options, key, value if isinstance( value, int )
+                         else str( value ) )
+            elif key in ( 'cmd', 'cpuset_cpus', 'shell', 'dpid', 'protocols' ):
+                setattr( options, key, str( value ) )
+        return options
+
+    def merged( self, override: NodeOptions ) -> NodeOptions:
+        """These settings with override's layered over them."""
+        return _mergedFields( self, override )
+
+    def dockerSettings( self ) -> list[ str ]:
+        """Names of the container-only settings that are set."""
+        docker = [ f.name for f in fields( self ) if f.name not in
+                   self.SWITCH + ( 'params', ) ]
+        return [ name for name in docker if getattr( self, name ) is not None ]
+
+    def toDict( self ) -> dict:
+        """Configuration form (environment as 'env', ports as 80/'8080:80')."""
+        result: dict = {}
+        for f in fields( self ):
+            value = getattr( self, f.name )
+            if value is None:
+                continue
+            if f.name == 'environment':
+                result[ 'env' ] = dict( value )
+            elif f.name == 'ports':
+                result[ 'ports' ] = [ port.toConfig() for port in value ]
+            else:
+                result[ f.name ] = copy.deepcopy( value )
+        return result
+
+
+@dataclass
+class ControllerSpec( object ):
+    """An OpenFlow controller the simulation's switches connect to."""
+
+    name: str
+
+    def toDict( self ) -> dict:
+        """Configuration form."""
+        return asdict( self )
+
+
+@dataclass
+class RemoteControllerSpec( ControllerSpec ):
+    """A controller that runs elsewhere, reached at ip:port."""
+
+    ip: str = '127.0.0.1'
+    port: int = 6653
+
+
 # Graph model
 
 @dataclass
@@ -263,12 +593,15 @@ class Endpoint( object ):
     ip: IPv4Interface | None = None
     #: False when the configured address had no /prefix
     explicitPrefix: bool = True
+    #: This end's own shaping (the direction it sends), over the link's
+    tc: Shaping = field( default_factory=Shaping )
 
     def toDict( self ) -> dict:
         """Resolved configuration form."""
         result: dict = { 'node': self.node, 'intf': self.intf }
         if self.ip is not None:
             result[ 'ip' ] = str( self.ip )
+        result.update( self.tc.toDict() )
         return result
 
 
@@ -282,12 +615,18 @@ class LinkSpec( object ):
     id: str | None = None
     cost: float = 1.0
     state: str = 'up'
-    tc: dict = field( default_factory=dict )
+    #: Shaping of both ends; an endpoint's own shaping is layered over it
+    tc: Shaping = field( default_factory=Shaping )
 
     @property
-    def endpoints( self ) -> tuple:
+    def endpoints( self ) -> tuple[ Endpoint, Endpoint ]:
         "Both endpoints, a first"
         return ( self.a, self.b )
+
+    def shaping( self, side: str ) -> Shaping:
+        """What one end ('a' or 'b') is shaped with: the link's shaping, with
+           the end's own over it. Each end shapes the traffic it sends."""
+        return self.tc.merged( self.a.tc if side == 'a' else self.b.tc )
 
     def label( self ) -> str:
         """Short description for log messages."""
@@ -298,12 +637,17 @@ class LinkSpec( object ):
         """Resolved configuration form."""
         result = { 'id': self.id, 'a': self.a.toDict(), 'b': self.b.toDict(),
                    'cost': self.cost, 'state': self.state }
-        for key, value in self.tc.items():
-            if key in ConfigParser.TC_KEYS:
-                result[ key ] = value
-            else:
-                result.setdefault( 'tc', {} )[ key ] = value
+        result.update( self.tc.toDict() )
         return result
+
+
+@dataclass
+class LinkDefaults( object ):
+    """The 'defaults.link' section: settings every link starts from."""
+
+    cost: float | None = None
+    state: str | None = None
+    tc: Shaping = field( default_factory=Shaping )
 
 
 @dataclass
@@ -352,8 +696,8 @@ class NodeSpec( object ):
     routes: list = field( default_factory=list )
     commands: list = field( default_factory=list )
     start: bool = False
-    #: Docker/switch options in configuration vocabulary
-    options: dict = field( default_factory=dict )
+    #: Docker/switch settings
+    options: NodeOptions = field( default_factory=NodeOptions )
     #: False for nodes that only appeared in links
     declared: bool = True
 
@@ -364,7 +708,7 @@ class NodeSpec( object ):
             result[ 'image' ] = self.image
         if self.gateway is not None:
             result[ 'gateway' ] = str( self.gateway )
-        result.update( copy.deepcopy( self.options ) )
+        result.update( self.options.toDict() )
         if self.routes:
             result[ 'routes' ] = [ route.toDict() for route in self.routes ]
         if self.commands:
@@ -419,7 +763,9 @@ class Settings( object ):
     lanPrefix: int = 24
     routing: str = 'static'
     backupRoutes: bool = True
-    defaults: dict = field( default_factory=dict )
+    #: The 'defaults' section: settings every node of a kind starts from
+    nodeDefaults: dict[ NodeKind, NodeSpec ] = field( default_factory=dict )
+    linkDefaults: LinkDefaults = field( default_factory=LinkDefaults )
 
     def toDict( self ) -> dict:
         """Resolved configuration form."""
@@ -445,7 +791,7 @@ class SimGraph( object ):
         self.settings = Settings()
         self.nodes: dict[ str, NodeSpec ] = {}
         self.links: list[ LinkSpec ] = []
-        self.controllers: list[ dict ] = []
+        self.controllers: list[ ControllerSpec ] = []
         self.segments: list[ Segment ] = []
         self._adjacency: dict[ str, list[ Adjacency ] ] | None = None
 
@@ -541,7 +887,8 @@ class SimGraph( object ):
         result: dict = { 'name': self.name }
         result.update( self.settings.toDict() )
         if self.controllers:
-            result[ 'controllers' ] = copy.deepcopy( self.controllers )
+            result[ 'controllers' ] = [ controller.toDict()
+                                        for controller in self.controllers ]
         result[ 'nodes' ] = { name: spec.toDict()
                               for name, spec in self.nodes.items() }
         result[ 'links' ] = [ link.toDict() for link in self.links ]
@@ -574,14 +921,11 @@ class ConfigParser( object ):
 
     TOP_KEYS = ( 'name', 'defaults', 'addressing', 'routing', 'controllers',
                  'nodes', 'links' )
-    DOCKER_KEYS = ( 'cmd', 'env', 'environment', 'ports', 'volumes',
-                    'privileged', 'sysctls', 'cpus', 'mem_limit',
-                    'memswap_limit', 'cpu_shares', 'cpu_quota', 'cpu_period',
-                    'cpuset_cpus', 'dns', 'devices', 'cap_add', 'shell' )
-    SWITCH_KEYS = ( 'dpid', 'protocols', 'fail_mode' )
+    DOCKER_KEYS = NodeOptions.DOCKER
+    SWITCH_KEYS = NodeOptions.SWITCH
     NODE_KEYS = ( ( 'name', 'kind', 'image', 'ip', 'gateway', 'routes', 'exec',
                     'start', 'params' ) + DOCKER_KEYS + SWITCH_KEYS )
-    TC_KEYS = ( 'delay', 'jitter', 'loss', 'bw', 'max_queue_size' )
+    TC_KEYS = Shaping.BASIC
     LINK_KEYS = ( ( 'id', 'a', 'b', 'endpoints', 'cost', 'state', 'tc' )
                   + TC_KEYS )
     ENDPOINT_KEYS = ( 'node', 'intf', 'ip' )
@@ -684,11 +1028,17 @@ class ConfigParser( object ):
         self._checkKeys( data, allowed, 'defaults' )
         for key in allowed:
             section = data.get( key ) or {}
+            where = 'defaults.%s' % key
             if not isinstance( section, dict ):
-                raise SimConfigError( "defaults.%s must be a mapping" % key )
-            keys = self.LINK_KEYS if key == 'link' else self.NODE_KEYS
-            self._checkKeys( section, keys, 'defaults.%s' % key )
-            graph.settings.defaults[ key ] = section
+                raise SimConfigError( "%s must be a mapping" % where )
+            if key == 'link':
+                self._checkKeys( section, self.LINK_KEYS, where )
+                cost, state = self._costAndState( section, None, None, where )
+                graph.settings.linkDefaults = LinkDefaults(
+                    cost=cost, state=state, tc=self._shaping( section, where ) )
+            else:
+                graph.settings.nodeDefaults[ NodeKind( key ) ] = \
+                    self._parseNode( where, section )
 
     def _parseAddressing( self, graph: SimGraph, data: Any ) -> None:
         """Parse the addressing section (or a boolean)."""
@@ -727,20 +1077,20 @@ class ConfigParser( object ):
         graph.settings.routing = mode
         graph.settings.backupRoutes = bool( data.get( 'backup_routes', True ) )
 
-    def _parseControllers( self, data: Any ) -> list[ dict ]:
-        """Parse the controllers list."""
+    def _parseControllers( self, data: Any ) -> list[ ControllerSpec ]:
+        """Parse the controllers list (controllers running elsewhere)."""
         if isinstance( data, ( str, dict ) ):
             data = [ data ]
-        controllers = []
+        controllers: list[ ControllerSpec ] = []
         for index, item in enumerate( data ):
+            where = 'controllers[%d]' % index
             if isinstance( item, str ):
                 item = { 'name': item }
-            self._checkKeys( item, ( 'name', 'ip', 'port' ),
-                             'controllers[%d]' % index )
-            controllers.append( {
-                'name': str( item.get( 'name' ) or 'c%d' % index ),
-                'ip': str( item.get( 'ip', '127.0.0.1' ) ),
-                'port': int( item.get( 'port', 6653 ) ) } )
+            self._checkKeys( item, ( 'name', 'ip', 'port' ), where )
+            controllers.append( RemoteControllerSpec(
+                name=str( item.get( 'name' ) or 'c%d' % index ),
+                ip=str( item.get( 'ip', '127.0.0.1' ) ),
+                port=_number( item.get( 'port', 6653 ), where + '.port', int ) ) )
         return controllers
 
     def _iterNodes( self, data: Any ) -> Iterator[ tuple ]:
@@ -790,10 +1140,10 @@ class ConfigParser( object ):
         spec.commands = [ commands ] if isinstance( commands, str ) else [
             str( command ) for command in commands ]
         spec.start = bool( data.get( 'start', False ) )
-        spec.options = { key: copy.deepcopy( value )
-                         for key, value in data.items()
-                         if key in self.DOCKER_KEYS + self.SWITCH_KEYS
-                         + ( 'params', ) }
+        spec.options = NodeOptions.fromDict(
+            { key: value for key, value in data.items()
+              if key in self.DOCKER_KEYS + self.SWITCH_KEYS + ( 'params', ) },
+            'node %s' % name )
         return spec
 
     def _parseRoute( self, data: Any, node: str ) -> RouteSpec:
@@ -829,12 +1179,41 @@ class ConfigParser( object ):
         if not isinstance( data, dict ) or not data.get( 'node' ):
             raise SimConfigError( '%s: endpoint must be a node name or a '
                                   'mapping with "node"' % where )
-        self._checkKeys( data, self.ENDPOINT_KEYS, where )
-        endpoint = Endpoint( str( data[ 'node' ] ), data.get( 'intf' ) )
+        self._checkKeys( data, self.ENDPOINT_KEYS + self.TC_KEYS + ( 'tc', ),
+                         where )
+        endpoint = Endpoint( str( data[ 'node' ] ), data.get( 'intf' ),
+                             tc=self._shaping( data, where ) )
         if data.get( 'ip' ) is not None:
             endpoint.ip, endpoint.explicitPrefix = self._interface(
                 data[ 'ip' ], where )
         return endpoint
+
+    def _shaping( self, data: dict, where: str ) -> Shaping:
+        """The shaping of a link or endpoint: its 'tc' mapping, overridden by
+           the options written directly on it."""
+        tc = data.get( 'tc' ) or {}
+        if not isinstance( tc, dict ):
+            raise SimConfigError( '%s.tc must be a mapping' % where )
+        known = [ f.name for f in fields( Shaping ) ]
+        self._checkKeys( tc, known, where + '.tc' )
+        tc = { key: value for key, value in tc.items() if key in known }
+        tc.update( { key: data[ key ] for key in self.TC_KEYS if key in data } )
+        return Shaping.fromDict( tc, where )
+
+    @staticmethod
+    def _costAndState( data: dict, cost: float | None, state: str | None,
+                       where: str ) -> tuple[ float | None, str | None ]:
+        """A link's cost and state, falling back to the given values."""
+        if data.get( 'state' ) is not None:
+            state = str( data[ 'state' ] ).lower()
+            if state not in ( 'up', 'down' ):
+                raise SimConfigError( "%s: state must be 'up' or 'down'"
+                                      % where )
+        if data.get( 'cost' ) is not None:
+            cost = _number( data[ 'cost' ], where + '.cost' )
+            if cost <= 0:
+                raise SimConfigError( '%s: cost must be positive' % where )
+        return cost, state
 
     def _parseLink( self, index: int, data: Any, graph: SimGraph ) -> LinkSpec:
         """Parse one link in string, pair or mapping form."""
@@ -852,7 +1231,6 @@ class ConfigParser( object ):
             data = { 'a': data[ 0 ], 'b': data[ 1 ] }
         elif not isinstance( data, dict ):
             raise SimConfigError( '%s: unsupported link format' % where )
-        data = _deepMerge( graph.settings.defaults.get( 'link', {} ), data )
         self._checkKeys( data, self.LINK_KEYS, where )
         if 'endpoints' in data:
             pair = data[ 'endpoints' ]
@@ -863,19 +1241,15 @@ class ConfigParser( object ):
             data.setdefault( 'b', pair[ 1 ] )
         if 'a' not in data or 'b' not in data:
             raise SimConfigError( '%s: missing endpoint "a" or "b"' % where )
-        state = str( data.get( 'state', 'up' ) ).lower()
-        if state not in ( 'up', 'down' ):
-            raise SimConfigError( "%s: state must be 'up' or 'down'" % where )
-        tc = dict( data.get( 'tc' ) or {} )
-        tc.update( { key: data[ key ] for key in self.TC_KEYS if key in data } )
-        cost = float( data.get( 'cost', 1 ) )
-        cost = int( cost ) if cost.is_integer() else cost
-        if cost <= 0:
-            raise SimConfigError( '%s: cost must be positive' % where )
+        defaults = graph.settings.linkDefaults
+        cost, state = self._costAndState( data, defaults.cost, defaults.state,
+                                          where )
         return LinkSpec( index=index,
                          a=self._parseEndpoint( data[ 'a' ], where + '.a' ),
                          b=self._parseEndpoint( data[ 'b' ], where + '.b' ),
-                         id=data.get( 'id' ), cost=cost, state=state, tc=tc )
+                         id=data.get( 'id' ), cost=1 if cost is None else cost,
+                         state=state or 'up',
+                         tc=defaults.tc.merged( self._shaping( data, where ) ) )
 
 
 # Completion passes
@@ -953,62 +1327,56 @@ class NodeDefaults( CompletionPass ):
     """Applies per-kind defaults and built-in requirements."""
 
     BUILTIN = {
-        NodeKind.HOST: { 'image': 'alpine:3.20' },
-        NodeKind.ROUTER: {
-            'image': 'alpine:3.20',
-            'privileged': True,
-            # forwarding, and no reverse-path filtering so backup paths work
-            'sysctls': { 'net.ipv4.ip_forward': 1,
-                         'net.ipv4.conf.all.rp_filter': 0,
-                         'net.ipv4.conf.default.rp_filter': 0 } },
-        NodeKind.SWITCH: {},
+        NodeKind.HOST: NodeSpec( 'host', image='alpine:3.20' ),
+        NodeKind.ROUTER: NodeSpec( 'router', image='alpine:3.20', options=(
+            NodeOptions(
+                privileged=True,
+                # forwarding, and no reverse-path filtering so backup paths work
+                sysctls={ 'net.ipv4.ip_forward': 1,
+                          'net.ipv4.conf.all.rp_filter': 0,
+                          'net.ipv4.conf.default.rp_filter': 0 } ) ) ),
+        NodeKind.SWITCH: NodeSpec( 'switch' ),
     }
 
     def apply( self, graph: SimGraph ) -> None:
         """See CompletionPass.apply."""
         for spec in graph.nodes.values():
-            configured = graph.settings.defaults.get( spec.kind.value, {} )
             builtin = self.BUILTIN[ spec.kind ]
+            configured = ( graph.settings.nodeDefaults.get( spec.kind )
+                           or NodeSpec( spec.kind.value ) )
             if spec.image is None and spec.kind.isL3:
-                if configured.get( 'image' ):
-                    spec.image = configured[ 'image' ]
+                if configured.image:
+                    spec.image = configured.image
                 else:
-                    spec.image = builtin[ 'image' ]
+                    spec.image = builtin.image
                     graph.log.assume( spec.name, 'image %s (built-in default '
                                       'for %ss)' % ( spec.image,
                                                      spec.kind.value ) )
-            merged = _deepMerge( { k: v for k, v in builtin.items()
-                                   if k != 'image' }, configured )
-            for key in ( 'kind', 'name', 'image' ):
-                merged.pop( key, None )
-            for key in ( 'routes', 'exec', 'start', 'ip', 'gateway' ):
-                value = merged.pop( key, None )
-                if value is not None and key == 'start' and not spec.start:
-                    spec.start = bool( value )
-                elif value is not None and key == 'exec' and not spec.commands:
-                    spec.commands = [ value ] if isinstance( value, str ) \
-                        else list( value )
-            spec.options = _deepMerge( merged, spec.options )
+            # Of the other settings, defaults supply start, exec and the
+            # Docker/switch settings
+            spec.start = spec.start or configured.start
+            spec.commands = spec.commands or list( configured.commands )
+            spec.options = builtin.options.merged(
+                configured.options ).merged( spec.options )
             if spec.kind is NodeKind.SWITCH:
                 self._checkSwitch( spec, graph )
-            if spec.kind is NodeKind.ROUTER and not spec.options.get(
-                    'sysctls', {} ).get( 'net.ipv4.ip_forward' ):
+            if spec.kind is NodeKind.ROUTER and not (
+                    spec.options.sysctls or {} ).get( 'net.ipv4.ip_forward' ):
                 graph.log.warning( spec.name, 'router without '
                                    'net.ipv4.ip_forward=1 will not forward' )
 
     @staticmethod
     def _checkSwitch( spec: NodeSpec, graph: SimGraph ) -> None:
         """Warn about container settings on switches."""
-        dockerOnly = [ key for key in spec.options
-                       if key in ConfigParser.DOCKER_KEYS ]
+        dockerOnly = spec.options.dockerSettings()
         if spec.image or dockerOnly:
             graph.log.warning( spec.name, 'switches are Open vSwitch bridges; '
                                'ignoring %s' % ', '.join(
                                    ( [ 'image' ] if spec.image else [] )
                                    + dockerOnly ) )
             spec.image = None
-            for key in dockerOnly:
-                spec.options.pop( key )
+            spec.options = replace( spec.options,
+                                    **{ name: None for name in dockerOnly } )
 
 
 class SwitchIdentity( CompletionPass ):
@@ -1018,11 +1386,11 @@ class SwitchIdentity( CompletionPass ):
         """See CompletionPass.apply."""
         switches = [ spec for spec in graph.nodes.values()
                      if spec.kind is NodeKind.SWITCH ]
-        used = { int( str( spec.options[ 'dpid' ] ).replace( ':', '' ), 16 )
-                 for spec in switches if spec.options.get( 'dpid' ) }
+        used = { int( spec.options.dpid.replace( ':', '' ), 16 )
+                 for spec in switches if spec.options.dpid }
         nextId = 1
         for spec in switches:
-            if spec.options.get( 'dpid' ):
+            if spec.options.dpid:
                 continue
             digits = re.findall( r'\d+', spec.name )
             dpid = int( digits[ 0 ] ) if digits else None
@@ -1034,7 +1402,7 @@ class SwitchIdentity( CompletionPass ):
                 dpid = nextId
                 graph.log.assume( spec.name, 'dpid %d (%s)' % ( dpid, reason ) )
             used.add( dpid )
-            spec.options[ 'dpid' ] = '%016x' % dpid
+            spec.options.dpid = '%016x' % dpid
 
 
 class InterfaceNaming( CompletionPass ):
@@ -1470,9 +1838,11 @@ class Simulation( object ):
 class SimulationBuilder( object ):
     """Creates Containernet objects from a completed SimGraph."""
 
-    # configuration key -> Docker keyword argument
-    DOCKER_ARGS = { 'cmd': 'dcmd', 'env': 'environment', 'shell': 'dshell' }
-    SWITCH_ARGS = { 'fail_mode': 'failMode' }
+    #: Docker settings passed to addDocker() under the same name
+    DOCKER_PASSTHROUGH = ( 'volumes', 'privileged', 'cpus', 'mem_limit',
+                           'memswap_limit', 'cpu_shares', 'cpu_quota',
+                           'cpu_period', 'cpuset_cpus', 'dns', 'devices',
+                           'cap_add' )
 
     def __init__( self, graph: SimGraph ) -> None:
         """graph: completed graph (see GraphCompleter)"""
@@ -1488,10 +1858,12 @@ class SimulationBuilder( object ):
 
         net = Containernet( controller=None, intf=TCIntf, link=TCLink )
         for controller in self.graph.controllers:
-            net.addController( controller[ 'name' ],
-                               controller=RemoteController,
-                               ip=controller[ 'ip' ],
-                               port=controller[ 'port' ] )
+            if not isinstance( controller, RemoteControllerSpec ):
+                raise SimConfigError( 'controller %s: only controllers '
+                                      'running elsewhere (ip, port) can be '
+                                      'used here' % controller.name )
+            net.addController( controller.name, controller=RemoteController,
+                               ip=controller.ip, port=controller.port )
         switchCls = OVSSwitch if self.graph.controllers else OVSBridge
         nodes = {}
         try:
@@ -1508,57 +1880,57 @@ class SimulationBuilder( object ):
                 links[ link.id ] = net.addLink(
                     nodes[ link.a.node ], nodes[ link.b.node ], cls=TCLink,
                     intfName1=link.a.intf, intfName2=link.b.intf,
-                    params1=self._intfParams( link.a ),
-                    params2=self._intfParams( link.b ), **link.tc )
+                    params1=self._intfParams( link, 'a' ),
+                    params2=self._intfParams( link, 'b' ) )
         except BaseException:
             net.stop()
             raise
         return Simulation( self.graph, net, nodes, links )
 
     @staticmethod
-    def _intfParams( endpoint: Endpoint ) -> dict:
-        """Interface parameters for one side of a link."""
-        return { 'ip': str( endpoint.ip ) } if endpoint.ip is not None else {}
+    def _intfParams( link: LinkSpec, side: str ) -> dict:
+        """Interface parameters for one side of a link: address and shaping."""
+        endpoint = link.a if side == 'a' else link.b
+        params = link.shaping( side ).params()
+        if endpoint.ip is not None:
+            params[ 'ip' ] = str( endpoint.ip )
+        return params
 
     def dockerArgs( self, spec: NodeSpec ) -> dict:
-        """Translate configuration options into Docker keyword arguments."""
-        options = dict( spec.options )
-        args = dict( options.pop( 'params', None ) or {} )
-        for key in ConfigParser.SWITCH_KEYS:
-            options.pop( key, None )
-        ports = options.pop( 'ports', None ) or []
-        if ports:
-            args[ 'ports' ], args[ 'port_bindings' ] = self.parsePorts( ports )
-        if 'sysctls' in options:
-            options[ 'sysctls' ] = { key: str( value ) for key, value
-                                     in options[ 'sysctls' ].items() }
-        for key, value in options.items():
-            args[ self.DOCKER_ARGS.get( key, key ) ] = value
+        """Translate a node's settings into addDocker() keyword arguments."""
+        options = spec.options
+        args = copy.deepcopy( options.params or {} )
+        if options.ports:
+            args[ 'ports' ] = [ port.containerPort for port in options.ports ]
+            args[ 'port_bindings' ] = { port.containerPort: port.hostPort
+                                        for port in options.ports }
+        if options.sysctls is not None:
+            args[ 'sysctls' ] = { key: str( value ) for key, value
+                                  in options.sysctls.items() }
+        if options.environment is not None:
+            args[ 'environment' ] = dict( options.environment )
+        if options.cmd is not None:
+            args[ 'dcmd' ] = options.cmd
+        if options.shell is not None:
+            args[ 'dshell' ] = options.shell
+        for name in self.DOCKER_PASSTHROUGH:
+            if getattr( options, name ) is not None:
+                args[ name ] = copy.deepcopy( getattr( options, name ) )
         return args
 
     def switchArgs( self, spec: NodeSpec ) -> dict:
-        """Translate configuration options into addSwitch keyword args."""
-        options = dict( spec.options )
-        args = dict( options.pop( 'params', None ) or {} )
+        """Translate a node's settings into addSwitch() keyword arguments."""
+        options = spec.options
+        args = copy.deepcopy( options.params or {} )
         if self.graph.controllers:
             args.setdefault( 'protocols', 'OpenFlow13' )
-        for key in ConfigParser.SWITCH_KEYS:
-            if key in options:
-                args[ self.SWITCH_ARGS.get( key, key ) ] = str( options[ key ] )
+        if options.dpid is not None:
+            args[ 'dpid' ] = options.dpid
+        if options.protocols is not None:
+            args[ 'protocols' ] = options.protocols
+        if options.fail_mode is not None:
+            args[ 'failMode' ] = options.fail_mode
         return args
-
-    @staticmethod
-    def parsePorts( ports: Iterable[ Any ] ) -> tuple:
-        """Parse 'host:container' / container port entries.
-           returns: ( container ports, { container: host or None } )"""
-        containerPorts, bindings = [], {}
-        for entry in ports:
-            text = str( entry )
-            host, _, container = text.rpartition( ':' )
-            containerPort = int( container )
-            containerPorts.append( containerPort )
-            bindings[ containerPort ] = int( host ) if host else None
-        return containerPorts, bindings
 
 
 # Convenience API
