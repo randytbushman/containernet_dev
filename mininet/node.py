@@ -68,7 +68,7 @@ from re import findall
 from subprocess import Popen, PIPE, check_output
 from sys import exit  # pylint: disable=redefined-builtin
 from time import sleep, time
-from typing import Optional
+from ipaddress import IPv4Network
 
 from mininet.container import ( ImageReference, ShellProfile,
                                 INTERACTIVE_SHELLS )
@@ -135,7 +135,7 @@ class Node( object ):
         self._cmdLock = threading.RLock()
 
         # Strategy for ip/tc/ethtool commands (see createNetRunner)
-        self._netRunner: Optional[ NetCommandRunner ] = None
+        self._netRunner: NetCommandRunner | None = None
 
         # Start command interpreter shell
         self.master, self.slave = None, None  # pylint
@@ -651,12 +651,12 @@ class Node( object ):
         return self.netCmd( 'ip', 'neigh', 'replace', ip, 'lladdr', mac,
                             'dev', intf )
 
-    def setHostRoute( self, ip: str, intf ) -> str:
+    def setHostRoute( self, ip: str, intf: Intf | str ) -> str:
         """Add route to host.
            ip: IP address as dotted decimal
            intf: Intf or interface name
            returns: command output"""
-        return self.netCmd( 'ip', 'route', 'replace', '%s/32' % ip,
+        return self.netCmd( 'ip', 'route', 'replace', str( IPv4Network( ip ) ),
                             'dev', intf )
 
     def setDefaultRoute( self, intf=None ) -> str:
@@ -818,7 +818,7 @@ class Docker ( Host ):
     dnameprefix = "mn"
 
     #: Docker client shared by all containers (one connection pool)
-    _sharedClient: Optional[ docker.DockerClient ] = None
+    _sharedClient: docker.DockerClient | None = None
 
     # Defaults for the keyword arguments accepted by __init__
     _DEFAULTS = { 'cpu_quota': None,
@@ -846,10 +846,10 @@ class Docker ( Host ):
                   'privileged': False,
                   }
 
-    def __init__(self, name: str, dimage: Optional[ str ] = None,
-                 dcmd: Optional[ str ] = None,
-                 build_params: Optional[ dict ] = None,
-                 dshell: Optional[ str ] = None, **kwargs):
+    def __init__(self, name: str, dimage: str | None = None,
+                 dcmd: str | None = None,
+                 build_params: dict | None = None,
+                 dshell: str | None = None, **kwargs):
         """
         Creates a Docker container as Mininet host.
 
@@ -886,7 +886,7 @@ class Docker ( Host ):
         self.dimage = dimage
         self.dcmd = dcmd if dcmd is not None else "/bin/sh"
         self.dshell = dshell
-        self.shellProfile: Optional[ ShellProfile ] = None
+        self.shellProfile: ShellProfile | None = None
         self.dc = None  # dict containing 'Id' and 'Warnings' keys of the container
         self.dcinfo = None
         self.did = None  # Id of running container
@@ -1060,7 +1060,7 @@ class Docker ( Host ):
 
     # Image ENTRYPOINT / CMD support
 
-    def _imageConfig( self, imagename: Optional[ str ] = None ) -> dict:
+    def _imageConfig( self, imagename: str | None = None ) -> dict:
         """Return (and cache) the 'Config' section of an image.
            imagename: image reference; defaults to our image"""
         imagename = imagename or self.dimage
@@ -1074,7 +1074,7 @@ class Docker ( Host ):
             self._imageConfigCache[ imagename ] = imgd.get( "Config" ) or {}
         return self._imageConfigCache[ imagename ]
 
-    def imageStartCommand( self ) -> Optional[ str ]:
+    def imageStartCommand( self ) -> str | None:
         """Return the image's ENTRYPOINT + CMD as one shell-quoted command,
            or None if there is nothing to run."""
         argv = ( ( self.get_entrypoint_field( self.dimage ) or [] ) +

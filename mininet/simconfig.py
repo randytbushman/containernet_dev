@@ -155,7 +155,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional, Union
+from typing import Any, Iterable, Iterator
 
 from mininet.log import info, warn, setLogLevel
 
@@ -259,8 +259,8 @@ class Endpoint( object ):
     """One side of a link."""
 
     node: str
-    intf: Optional[ str ] = None
-    ip: Optional[ IPv4Interface ] = None
+    intf: str | None = None
+    ip: IPv4Interface | None = None
     #: False when the configured address had no /prefix
     explicitPrefix: bool = True
 
@@ -279,7 +279,7 @@ class LinkSpec( object ):
     index: int
     a: Endpoint
     b: Endpoint
-    id: Optional[ str ] = None
+    id: str | None = None
     cost: float = 1.0
     state: str = 'up'
     tc: dict = field( default_factory=dict )
@@ -311,9 +311,9 @@ class RouteSpec( object ):
     """A static IPv4 route."""
 
     destination: IPv4Network
-    via: Optional[ IPv4Address ] = None
-    dev: Optional[ str ] = None
-    metric: Optional[ int ] = None
+    via: IPv4Address | None = None
+    dev: str | None = None
+    metric: int | None = None
     origin: str = 'config'
 
     def argv( self ) -> list[ str ]:
@@ -345,10 +345,10 @@ class NodeSpec( object ):
     """A node and its (config-level) settings."""
 
     name: str
-    kind: Optional[ NodeKind ] = None
-    image: Optional[ str ] = None
-    ip: Optional[ IPv4Interface ] = None
-    gateway: Optional[ IPv4Address ] = None
+    kind: NodeKind | None = None
+    image: str | None = None
+    ip: IPv4Interface | None = None
+    gateway: IPv4Address | None = None
     routes: list = field( default_factory=list )
     commands: list = field( default_factory=list )
     start: bool = False
@@ -383,7 +383,7 @@ class Segment( object ):
     index: int
     switches: set = field( default_factory=set )
     members: list = field( default_factory=list )  # [ ( LinkSpec, Endpoint ) ]
-    network: Optional[ IPv4Network ] = None
+    network: IPv4Network | None = None
 
     @property
     def isPointToPoint( self ) -> bool:
@@ -437,7 +437,7 @@ class SimGraph( object ):
     """The simulation as a graph of nodes, links and L2 segments."""
 
     def __init__( self, name: str = 'simulation',
-                  log: Optional[ InferenceLog ] = None ) -> None:
+                  log: InferenceLog | None = None ) -> None:
         """name: simulation name
            log: inference log (a new one is created if omitted)"""
         self.name = name
@@ -447,7 +447,7 @@ class SimGraph( object ):
         self.links: list[ LinkSpec ] = []
         self.controllers: list[ dict ] = []
         self.segments: list[ Segment ] = []
-        self._adjacency: Optional[ dict[ str, list[ Adjacency ] ] ] = None
+        self._adjacency: dict[ str, list[ Adjacency ] ] | None = None
 
     # Structure
 
@@ -468,7 +468,7 @@ class SimGraph( object ):
         self.links.append( link )
         return link
 
-    def kindOf( self, name: str ) -> Optional[ NodeKind ]:
+    def kindOf( self, name: str ) -> NodeKind | None:
         """Kind of a node (None while still unknown)."""
         return self.nodes[ name ].kind
 
@@ -598,7 +598,7 @@ class ConfigParser( object ):
     # Entry points
 
     @staticmethod
-    def readFile( path: Union[ str, Path ] ) -> dict:
+    def readFile( path: str | Path ) -> dict:
         """Read a YAML or JSON configuration file.
            raises: SimConfigError if the file is not a mapping"""
         text = Path( path ).read_text()
@@ -645,7 +645,7 @@ class ConfigParser( object ):
                     key, ' (did you mean %r?)' % hint[ 0 ] if hint else '' ) )
 
     @staticmethod
-    def _interface( value: Any, where: str ) -> tuple:
+    def _interface( value: Any, where: str ) -> tuple[ IPv4Interface, bool ]:
         """Parse an interface address.
            returns: ( IPv4Interface, explicitPrefix )"""
         text = str( value ).strip()
@@ -779,7 +779,7 @@ class ConfigParser( object ):
         if data.get( 'ip' ) is not None:
             spec.ip, explicit = self._interface( data[ 'ip' ], 'node %s' % name )
             if not explicit:
-                spec.ip = IPv4Interface( '%s/24' % spec.ip.ip )
+                spec.ip = IPv4Interface( ( spec.ip.ip, 24 ) )
                 self.log.assume( name, 'ip %s has no prefix; using /24'
                                  % spec.ip.ip )
         if data.get( 'gateway' ) is not None:
@@ -1199,8 +1199,7 @@ class AddressPlanning( CompletionPass ):
                 if endpoint.ip is None or endpoint.explicitPrefix:
                     continue
                 prefix = known[ 0 ].prefixlen if known else 24
-                endpoint.ip = IPv4Interface( '%s/%d' % ( endpoint.ip.ip,
-                                                         prefix ) )
+                endpoint.ip = IPv4Interface( ( endpoint.ip.ip, prefix ) )
                 endpoint.explicitPrefix = True
                 graph.log.assume( endpoint.intf, 'address %s (prefix %s)' % (
                     endpoint.ip, 'from %s' % segment.label() if known
@@ -1262,8 +1261,8 @@ class AddressPlanning( CompletionPass ):
             except StopIteration:
                 raise SimConfigError( '%s: subnet %s is full'
                                       % ( segment.label(), segment.network ) )
-            endpoint.ip = IPv4Interface( '%s/%d' % (
-                address, segment.network.prefixlen ) )
+            endpoint.ip = IPv4Interface( ( address,
+                                           segment.network.prefixlen ) )
             graph.log.assume( endpoint.intf, 'address %s' % endpoint.ip )
 
 
@@ -1366,7 +1365,7 @@ class GraphCompleter( object ):
                        SwitchIdentity, InterfaceNaming, LinkIdentity,
                        SegmentDiscovery, AddressPlanning, RoutePlanning )
 
-    def __init__( self, passes: Optional[ Iterable[ CompletionPass ] ] = None
+    def __init__( self, passes: Iterable[ CompletionPass ] | None = None
                   ) -> None:
         """passes: pass instances to run (default: DEFAULT_PASSES)"""
         self.passes = ( list( passes ) if passes is not None
@@ -1564,8 +1563,8 @@ class SimulationBuilder( object ):
 
 # Convenience API
 
-def loadGraph( source: Union[ str, Path, dict ],
-               log: Optional[ InferenceLog ] = None ) -> SimGraph:
+def loadGraph( source: str | Path | dict,
+               log: InferenceLog | None = None ) -> SimGraph:
     """Parse and complete a configuration (no root needed).
        source: path to a YAML/JSON file, or an already loaded mapping
        log: inference log to use
@@ -1576,14 +1575,14 @@ def loadGraph( source: Union[ str, Path, dict ],
     return GraphCompleter().complete( parser.parse( data ) )
 
 
-def loadSimulation( source: Union[ str, Path, dict ],
-                    log: Optional[ InferenceLog ] = None ) -> Simulation:
+def loadSimulation( source: str | Path | dict,
+                    log: InferenceLog | None = None ) -> Simulation:
     """Parse, complete and build a simulation (requires root).
        Use start()/stop() or a with-block to run it."""
     return SimulationBuilder( loadGraph( source, log ) ).build()
 
 
-def main( argv: Optional[ list ] = None ) -> int:
+def main( argv: list | None = None ) -> int:
     """Command line entry point; see the module documentation."""
     parser = argparse.ArgumentParser(
         prog='python3 -m mininet.simconfig',

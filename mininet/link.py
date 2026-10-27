@@ -27,7 +27,8 @@ Link: basic link class for creating veth pairs
 from __future__ import annotations
 
 import re
-from typing import Callable, Optional
+from ipaddress import IPv4Interface
+from typing import Callable
 
 from mininet.log import info, error, debug
 from mininet.netexec import IfconfigTranslator
@@ -48,9 +49,8 @@ class Intf( object ):
        runner (node.netCmd), so it works even when a container image ships
        neither iproute2 nor net-tools."""
 
-    _ipMatchRegex = re.compile( r'\d+\.\d+\.\d+\.\d+' )
     _macMatchRegex = re.compile( r'..:..:..:..:..:..' )
-    _inetRegex = re.compile( r'\binet (\d+\.\d+\.\d+\.\d+)/(\d+)' )
+    _inetRegex = re.compile( r'\binet (\S+)' )
     _etherRegex = re.compile(
         r'link/ether ((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})' )
     _flagsRegex = re.compile( r'<([^>]*)>' )
@@ -67,7 +67,7 @@ class Intf( object ):
         self.link = link
         self.mac = mac
         self.ip, self.prefixLen = None, None
-        self._ifconfigOverride: Optional[ Callable[ ..., str ] ] = None
+        self._ifconfigOverride: Callable[ ..., str ] | None = None
 
         # if interface is lo, we know the ip is 127.0.0.1.
         # This saves a command per node
@@ -122,26 +122,26 @@ class Intf( object ):
             return self.netCmd( 'ifconfig', self.name, *tokens )
         return ''.join( self.netCmd( *argv ) for argv in commands )
 
-    def setIP( self, ipstr: str, prefixLen: Optional[ int ] = None,
+    def setIP( self, ipstr: str, prefixLen: int | None = None,
                overwrite: bool = True ) -> str:
         """Set our IPv4 address.
-           ipstr: address, optionally with '/prefixLen'
+           ipstr: address, optionally with '/prefixLen' (or '/netmask')
            prefixLen: prefix length if ipstr has none
            overwrite: remove existing IPv4 addresses first (IPv6,
                       including the link-local address, is preserved)
-           returns: command output"""
+           returns: command output
+           raises: ValueError for an invalid address or a missing prefix"""
         if '/' in ipstr:
-            ip, prefix = ipstr.split( '/', 1 )
+            address = IPv4Interface( ipstr )
         elif prefixLen is None:
             raise ValueError( 'No prefix length set for IP address %s'
                               % ( ipstr, ) )
         else:
-            ip, prefix = ipstr, prefixLen
-        self.ip, self.prefixLen = ip, int( prefix )
+            address = IPv4Interface( ( ipstr, prefixLen ) )
+        self.ip, self.prefixLen = str( address.ip ), address.network.prefixlen
         if overwrite:
             self.netCmd( 'ip', '-4', 'address', 'flush', 'dev', self.name )
-        return self.netCmd( 'ip', 'address', 'add',
-                            '%s/%s' % ( self.ip, self.prefixLen ),
+        return self.netCmd( 'ip', 'address', 'add', address.with_prefixlen,
                             'dev', self.name )
 
     def setMAC( self, macstr: str ) -> str:
@@ -159,28 +159,29 @@ class Intf( object ):
                                    'up' )
         return result
 
-    def updateIP( self ) -> Optional[ str ]:
+    def updateIP( self ) -> str | None:
         "Return updated IP address based on the kernel's address list"
         self.updateAddr()
         return self.ip
 
-    def updateMAC( self ) -> Optional[ str ]:
+    def updateMAC( self ) -> str | None:
         "Return updated MAC address based on the kernel's link info"
         self.updateAddr()
         return self.mac
 
-    def updateAddr( self ) -> tuple:
+    def updateAddr( self ) -> tuple[ str | None, str | None ]:
         """Return IP address and MAC address using a single query.
            returns: ( ip, mac ), either may be None"""
         output = self.netQuery( 'ip', 'address', 'show', 'dev', self.name )
         inet = self._inetRegex.search( output )
         ether = self._etherRegex.search( output )
-        self.ip, self.prefixLen = ( ( inet.group( 1 ), int( inet.group( 2 ) ) )
-                                    if inet else ( None, None ) )
+        address = IPv4Interface( inet.group( 1 ) ) if inet else None
+        self.ip, self.prefixLen = ( ( str( address.ip ), address.network.prefixlen )
+                                    if address else ( None, None ) )
         self.mac = ether.group( 1 ) if ether else None
         return self.ip, self.mac
 
-    def IP( self ):
+    def IP( self ) -> str | None:
         "Return IP address"
         return self.ip
 
@@ -329,7 +330,7 @@ class TCIntf( Intf ):
                          'Cannot delete qdisc with handle of zero' )
 
     @staticmethod
-    def _number( value: object, name: str ) -> Optional[ float ]:
+    def _number( value: object, name: str ) -> float | None:
         """Normalise a numeric shaping parameter.
            Accepts numbers or strings such as '10', '1.5' or '1%'.
            value: parameter value or None
@@ -425,7 +426,7 @@ class TCIntf( Intf ):
         debug(" *** executing command: %s\n" % c)
         return self.netCmd( c )
 
-    def rootQdiscHandle( self ) -> Optional[ str ]:
+    def rootQdiscHandle( self ) -> str | None:
         """Return the handle of the root qdisc, e.g. '5' or '0' for the
            kernel default (noqueue, pfifo_fast, fq_codel...).
            returns: handle string or None if it cannot be determined"""
