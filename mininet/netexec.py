@@ -25,7 +25,7 @@ import shlex
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 from mininet.log import debug
 
@@ -117,10 +117,10 @@ class NamespaceRunner( NetCommandRunner ):
        from the host. Falls back to another runner when nsenter cannot
        be used (not root, nsenter missing, process gone)."""
 
-    NSENTER: Optional[ str ] = shutil.which( 'nsenter' )
+    NSENTER: str | None = shutil.which( 'nsenter' )
 
     def __init__( self, pidFn: Callable[ [], int ],
-                  fallback: Optional[ NetCommandRunner ] = None ) -> None:
+                  fallback: NetCommandRunner | None = None ) -> None:
         """pidFn: returns the PID whose network namespace is entered
            fallback: runner used when nsenter is unusable"""
         super().__init__()
@@ -183,7 +183,7 @@ class IfconfigTranslator( object ):
 
     @classmethod
     def translate( cls, intf: str,
-                   args: Sequence[ str ] ) -> Optional[ list[ list[ str ] ] ]:
+                   args: Sequence[ str ] ) -> list[ list[ str ] ] | None:
         """Translate ifconfig arguments for one interface.
            intf: interface name
            args: ifconfig arguments following the interface name
@@ -191,10 +191,10 @@ class IfconfigTranslator( object ):
                     arguments are not understood"""
         if not args:
             return [ [ 'ip', 'address', 'show', 'dev', intf ] ]
-        address: Optional[ str ] = None
-        netmask: Optional[ str ] = None
+        address: str | None = None
+        netmask: str | None = None
         linkArgs: list[ str ] = []
-        state: Optional[ str ] = None
+        state: str | None = None
         i = 0
         while i < len( args ):
             token = args[ i ]
@@ -218,14 +218,13 @@ class IfconfigTranslator( object ):
                 return None
         commands: list[ list[ str ] ] = []
         if address is not None:
-            if '/' not in address:
-                mask = netmask or '255.255.255.255'
-                try:
-                    prefix = ipaddress.IPv4Network(
-                        '0.0.0.0/%s' % mask ).prefixlen
-                except ValueError:
-                    return None
-                address = '%s/%d' % ( address, prefix )
+            # An address without /len takes its prefix from the netmask
+            try:
+                address = ipaddress.IPv4Interface(
+                    address if '/' in address
+                    else ( address, netmask or 32 ) ).with_prefixlen
+            except ValueError:
+                return None
             commands.append( [ 'ip', '-4', 'address', 'flush', 'dev', intf ] )
             commands.append( [ 'ip', 'address', 'add', address,
                                'dev', intf ] )

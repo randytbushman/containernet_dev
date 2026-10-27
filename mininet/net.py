@@ -86,6 +86,8 @@ method may be called to shut down the network.
 
 """
 
+from __future__ import annotations
+
 import os
 import re
 import select
@@ -94,7 +96,9 @@ import random
 import shlex
 import ipaddress
 
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network
 from sys import exit  # pylint: disable=redefined-builtin
+from typing import TYPE_CHECKING, Callable
 from time import sleep
 from itertools import chain, groupby
 from math import ceil
@@ -108,11 +112,16 @@ from mininet.node import ( Node, Docker, Host, OVSKernelSwitch,
 from mininet.nodelib import NAT
 from mininet.link import Link, Intf
 from mininet.util import ( quietRun, fixLimits, numCores, ensureRoot,
-                           macColonHex, ipStr, ipParse, netParse, ipAdd,
+                           macColonHex, netParse, ipAdd,
                            waitListening, BaseString )
 from mininet.term import cleanUpScreens, makeTerms
 
 from subprocess import Popen
+
+if TYPE_CHECKING:
+    from mininet.fault_controllers.BaseFaultController import BaseFaultControllerStarter as FaultStarter
+    from mininet.node import Switch
+    from mininet.topo import Topo
 
 # Mininet version: should be consistent with README and LICENSE
 VERSION = "2.3.1b1"
@@ -126,13 +135,23 @@ class Mininet( object ):
     "Network emulation with hosts spawned in network namespaces."
 
     # pylint: disable=too-many-arguments
-    def __init__(self, topo=None, switch=OVSKernelSwitch, host=Host,
-                 controller=DefaultController, link=Link, intf=Intf,
-                 faultControllerStarter=ConfigFileFaultControllerStarter,
-                 build=True, xterms=False, cleanup=False, ipBase='10.0.0.0/8',
-                 inNamespace=False,
-                 autoSetMacs=False, autoStaticArp=False, autoPinCpus=False,
-                 listenPort=None, waitConnected=False, faultFilepath=None):
+    def __init__( self, topo: Topo | None = None,
+                  switch: Callable[ ..., Switch ] = OVSKernelSwitch,
+                  host: Callable[ ..., Host ] = Host,
+                  controller: ( Callable[ ..., Controller ]
+                                | list[ Callable[ ..., Controller ] ]
+                                | None ) = DefaultController,
+                  link: Callable[ ..., Link ] = Link,
+                  intf: Callable[ ..., Intf ] = Intf,
+                  faultControllerStarter: type[ FaultStarter ]
+                  = ConfigFileFaultControllerStarter,
+                  build: bool = True, xterms: bool = False,
+                  cleanup: bool = False, ipBase: str = '10.0.0.0/8',
+                  inNamespace: bool = False,
+                  autoSetMacs: bool = False, autoStaticArp: bool = False,
+                  autoPinCpus: bool = False, listenPort: int | None = None,
+                  waitConnected: bool | float = False,
+                  faultFilepath: str | None = None ) -> None:
         """Create Mininet object.
            topo: Topo (topology) object or None
            switch: default Switch class
@@ -160,8 +179,11 @@ class Mininet( object ):
         self.intf = intf
         self.ipBase = ipBase
         self.ipBaseNum, self.prefixLen = netParse( self.ipBase )
-        hostIP = ( 0xffffffff >> self.prefixLen ) & self.ipBaseNum
-        # Start for address allocation
+        self.ipNetwork = IPv4Network( ( self.ipBaseNum, self.prefixLen ),
+                                      strict=False )
+        # Start for address allocation: the base address's place in its
+        # network (10.0.0.5/8 starts at host 5), but never the network itself
+        hostIP = self.ipBaseNum - int( self.ipNetwork.network_address )
         self.nextIP = hostIP if hostIP > 0 else 1
         self.inNamespace = inNamespace
         self.xterms = xterms
@@ -224,24 +246,29 @@ class Mininet( object ):
                 remaining.remove( switch )
         return not remaining
 
-    def getNextIp( self ):
-        ip = ipAdd( self.nextIP,
-                    ipBaseNum=self.ipBaseNum,
-                    prefixLen=self.prefixLen ) + '/%s' % self.prefixLen
+    def hostAddress( self, number: int ) -> str:
+        """The address of a host in ipBase, with its prefix length.
+           number: host number within the network
+           returns: e.g. '10.0.0.3/8'"""
+        address = ipAdd( number, ipBaseNum=self.ipBaseNum,
+                         prefixLen=self.prefixLen )
+        return IPv4Interface( ( address, self.prefixLen ) ).with_prefixlen
+
+    def getNextIp( self ) -> str:
+        "Allocate the next host address (see hostAddress())."
+        ip = self.hostAddress( self.nextIP )
         self.nextIP += 1
         return ip
 
-    def addHost( self, name, cls=None, **params ):
+    def addHost( self, name: str, cls: Callable[ ..., Host ] | None = None,
+                 **params ) -> Host:
         """Add host.
            name: name of host to add
            cls: custom host class/constructor (optional)
            params: parameters for host
            returns: added host"""
         # Default IP and MAC addresses
-        defaults = { 'ip': ipAdd( self.nextIP,
-                                  ipBaseNum=self.ipBaseNum,
-                                  prefixLen=self.prefixLen ) +
-                                  '/%s' % self.prefixLen }
+        defaults = { 'ip': self.hostAddress( self.nextIP ) }
         if self.autoSetMacs:
             defaults[ 'mac' ] = macColonHex( self.nextIP )
         if self.autoPinCpus:
@@ -344,8 +371,8 @@ class Mininet( object ):
            may still attempt to connect to it!"""
         self.delNode( controller )
 
-    def addNAT( self, name='nat0', connect=True, inNamespace=False,
-                **params):
+    def addNAT( self, name: str = 'nat0', connect: bool | Node = True,
+                inNamespace: bool = False, **params ) -> NAT:
         """Add a NAT to the Mininet network
            name: name of NAT node
            connect: switch to connect to | True (s1) | None
@@ -362,7 +389,7 @@ class Mininet( object ):
             # Connect the nat to the switch
             self.addLink( nat, connect )
             # Set the default route on hosts
-            natIP = nat.params[ 'ip' ].split('/')[ 0 ]
+            natIP = IPv4Interface( nat.params[ 'ip' ] ).ip
             for host in self.hosts:
                 if host.inNamespace:
                     host.setDefaultRoute( 'via %s' % natIP )
@@ -513,7 +540,7 @@ class Mininet( object ):
             self.delLink( link )
         return links
 
-    def configHosts( self ):
+    def configHosts( self ) -> None:
         """Configure a set of hosts.
            An address assigned explicitly to a host's default interface
            (e.g. addLink( ..., params1={ 'ip': ... } )) takes precedence
@@ -523,7 +550,8 @@ class Mininet( object ):
             intf = host.defaultIntf()
             if intf and intf.IP() is not None:
                 # Keep the link-level address and record it on the host
-                host.params[ 'ip' ] = '%s/%s' % ( intf.IP(), intf.prefixLen )
+                host.params[ 'ip' ] = IPv4Interface(
+                    ( intf.IP(), intf.prefixLen ) ).with_prefixlen
                 host.config( **dict( host.params, ip=None ) )
             elif intf:
                 host.configDefault()
@@ -1217,23 +1245,24 @@ class MininetWithControlNet( Mininet ):
     # We still need to figure out the right way to pass
     # in the control network location.
 
-    def configureRoutedControlNetwork( self, ip='192.168.123.1',
-                                       prefixLen=16 ):
+    def configureRoutedControlNetwork( self, ip: str = '192.168.123.1',
+                                       prefixLen: int = 16 ) -> None:
         """Configure a routed control network on controller and switches.
            For use with the user datapath only right now."""
         controller = self.controllers[ 0 ]
         info( controller.name + ' <->' )
         cip = ip
-        snum = ipParse( ip )
+        address = IPv4Address( ip )
         for switch in self.switches:
             info( ' ' + switch.name )
             link = self.link( switch, controller, port1=0 )
             sintf, cintf = link.intf1, link.intf2
             switch.controlIntf = sintf
-            snum += 1
-            while snum & 0xff in [ 0, 255 ]:
-                snum += 1
-            sip = ipStr( snum )
+            # The next address that doesn't end in .0 or .255
+            address += 1
+            while address.packed[ -1 ] in ( 0, 255 ):
+                address += 1
+            sip = str( address )
             cintf.setIP( cip, prefixLen )
             sintf.setIP( sip, prefixLen )
             controller.setHostRoute( sip, cintf )

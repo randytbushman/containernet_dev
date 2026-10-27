@@ -13,7 +13,8 @@ from mininet.link import Intf, TCIntf, Link, MAX_INTF_NAME_LEN
 from mininet.netexec import ( IfconfigTranslator, NamespaceRunner,
                               NetCommandRunner, joinCommand )
 from mininet.node import Node
-from mininet.util import retry, versionTuple
+from mininet.util import ( ipAdd, ipNum, ipParse, ipStr, netParse, retry,
+                           versionTuple )
 
 
 class testIfconfigTranslator( unittest.TestCase ):
@@ -233,6 +234,41 @@ class testTrafficControlCommands( unittest.TestCase ):
             'qdisc netem 10: root refcnt 2 limit 1000' ).group( 1 ), '10' )
 
 
+class testIpHelpers( unittest.TestCase ):
+    """Mininet's IPv4 helpers (mininet.util)."""
+
+    def testStrAndNum( self ):
+        self.assertEqual( ipStr( 0x0a000001 ), '10.0.0.1' )
+        self.assertEqual( ipNum( 192, 168, 1, 254 ), 0xc0a801fe )
+        self.assertEqual( ipStr( ipNum( 255, 255, 255, 255 ) ),
+                          '255.255.255.255' )
+
+    def testParseShorthand( self ):
+        "Short addresses fill in zeros before their last part"
+        self.assertEqual( ipStr( ipParse( '10.1' ) ), '10.0.0.1' )
+        self.assertEqual( ipStr( ipParse( '10.1.2' ) ), '10.1.0.2' )
+        self.assertEqual( ipStr( ipParse( '192.168.1.2' ) ), '192.168.1.2' )
+
+    def testParseRejectsNonsense( self ):
+        for bad in ( '10.0.0.300', '10.0.0.1.5', 'host' ):
+            with self.subTest( bad ), self.assertRaises( ValueError ):
+                ipParse( bad )
+
+    def testNetParse( self ):
+        self.assertEqual( netParse( '10.0.0.0/8' ), ( 0x0a000000, 8 ) )
+        self.assertEqual( netParse( '10.0/8' ), ( 0x0a000000, 8 ) )
+        self.assertEqual( netParse( '192.168.1.5' ), ( 0xc0a80105, 24 ) )
+        self.assertEqual( netParse( '172.16.0.0/255.240.0.0' ),
+                          ( 0xac100000, 12 ) )
+
+    def testAdd( self ):
+        self.assertEqual( ipAdd( 1 ), '10.0.0.1' )
+        self.assertEqual( ipAdd( 5, 24, 0xc0a80177 ), '192.168.1.5' )
+        self.assertEqual( ipAdd( 3, 30, 0x0aff0004 ), '10.255.0.7' )
+        with self.assertRaises( AssertionError ):
+            ipAdd( 4, 30, 0x0aff0004 )
+
+
 class testIpOutputParsing( unittest.TestCase ):
     """Parsing of iproute2 output used by Intf."""
 
@@ -241,8 +277,41 @@ class testIpOutputParsing( unittest.TestCase ):
              '    inet 10.0.1.2/30 scope global e0\n' )
 
     def testAddress( self ):
-        self.assertEqual( Intf._inetRegex.search( self.SHOW ).groups(),
-                          ( '10.0.1.2', '30' ) )
+        self.assertEqual( Intf._inetRegex.search( self.SHOW ).group( 1 ),
+                          '10.0.1.2/30' )
+
+    @staticmethod
+    def intf( show: str = '' ) -> Intf:
+        "An Intf on a fake node that records commands and answers queries"
+        intf = Intf.__new__( Intf )
+        intf.name, intf.node = 'e0', mock.Mock()
+        intf.node.netCmd.return_value = ''
+        intf.node.netRunner.query.return_value = show
+        return intf
+
+    def testSetIP( self ):
+        for args, expected in ( ( ( '10.0.1.2/30', ), ( '10.0.1.2', 30 ) ),
+                                ( ( '10.0.1.2', 30 ), ( '10.0.1.2', 30 ) ),
+                                ( ( '10.0.1.2/255.255.255.0', ),
+                                  ( '10.0.1.2', 24 ) ) ):
+            with self.subTest( args ):
+                intf = self.intf()
+                intf.setIP( *args )
+                self.assertEqual( ( intf.ip, intf.prefixLen ), expected )
+                intf.node.netCmd.assert_called_with(
+                    'ip', 'address', 'add', '%s/%d' % expected, 'dev', 'e0' )
+
+    def testSetIPRejectsMistakes( self ):
+        with self.assertRaises( ValueError ):
+            self.intf().setIP( '10.0.1.2' )              # no prefix
+        with self.assertRaises( ValueError ):
+            self.intf().setIP( '10.0.1.300/24' )
+
+    def testUpdateAddr( self ):
+        intf = self.intf( self.SHOW )
+        self.assertEqual( intf.updateAddr(), ( '10.0.1.2', '02:42:ac:11:00:02' ) )
+        self.assertEqual( intf.prefixLen, 30 )
+        self.assertEqual( self.intf( 'no addresses' ).updateAddr(), ( None, None ) )
 
     def testMac( self ):
         self.assertEqual( Intf._etherRegex.search( self.SHOW ).group( 1 ),

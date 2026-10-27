@@ -1,9 +1,13 @@
 "Utility functions for Mininet."
 
+from __future__ import annotations
+
 import codecs
 import os
 import re
 import sys
+
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network
 
 from fcntl import fcntl, F_GETFL, F_SETFL
 from functools import partial
@@ -384,52 +388,43 @@ def macColonHex( mac ):
        returns: macStr MAC colon-hex string"""
     return _colonHex( mac, 6 )
 
-def ipStr( ip ):
+def ipStr( ip: int ) -> str:
     """Generate IP address string from an unsigned int.
        ip: unsigned int of form w << 24 | x << 16 | y << 8 | z
        returns: ip address string w.x.y.z"""
-    w = ( ip >> 24 ) & 0xff
-    x = ( ip >> 16 ) & 0xff
-    y = ( ip >> 8 ) & 0xff
-    z = ip & 0xff
-    return "%i.%i.%i.%i" % ( w, x, y, z )
+    return str( IPv4Address( ip & 0xffffffff ) )
 
-def ipNum( w, x, y, z ):
+def ipNum( w: int, x: int, y: int, z: int ) -> int:
     """Generate unsigned int from components of IP address
        returns: w << 24 | x << 16 | y << 8 | z"""
-    return ( w << 24 ) | ( x << 16 ) | ( y << 8 ) | z
+    return int( IPv4Address( bytes( ( w, x, y, z ) ) ) )
 
-def ipAdd( i, prefixLen=8, ipBaseNum=0x0a000000 ):
+def ipAdd( i: int, prefixLen: int = 8, ipBaseNum: int = 0x0a000000 ) -> str:
     """Return IP address string from ints
        i: int to be added to ipbase
        prefixLen: optional IP prefix length
        ipBaseNum: option base IP address as int
        returns IP address as string"""
-    imax = 0xffffffff >> prefixLen
-    assert i <= imax, 'Not enough IP addresses in the subnet'
-    mask = 0xffffffff ^ imax
-    ipnum = ( ipBaseNum & mask ) + i
-    return ipStr( ipnum )
+    network = IPv4Network( ( ipBaseNum, prefixLen ), strict=False )
+    assert i < network.num_addresses, 'Not enough IP addresses in the subnet'
+    return str( network.network_address + i )
 
-def ipParse( ip ):
-    "Parse an IP address and return an unsigned int."
-    args = [ int( arg ) for arg in ip.split( '.' ) ]
-    while len(args) < 4:
-        args.insert( len(args) - 1, 0 )
-    return ipNum( *args )
+def ipParse( ip: str ) -> int:
+    """Parse an IP address and return an unsigned int. Shortened addresses
+       fill in zeros before their last part, as inet_aton does:
+       '10.1' is 10.0.0.1 and '10.1.2' is 10.1.0.2."""
+    parts = ip.split( '.' )
+    parts[ -1:-1 ] = [ '0' ] * ( 4 - len( parts ) )
+    return int( IPv4Address( '.'.join( parts ) ) )
 
-def netParse( ipstr ):
+def netParse( ipstr: str ) -> tuple[ int, int ]:
     """Parse an IP network specification, returning
-       address and prefix len as unsigned ints"""
-    prefixLen = 0
-    if '/' in ipstr:
-        ip, pf = ipstr.split( '/' )
-        prefixLen = int( pf )
-    # if no prefix is specified, set the prefix to 24
-    else:
-        ip = ipstr
-        prefixLen = 24
-    return ipParse( ip ), prefixLen
+       address and prefix len as unsigned ints. The prefix may be a
+       length or a netmask, and defaults to 24; the address may be
+       shortened (see ipParse)."""
+    address, slash, prefix = ipstr.partition( '/' )
+    interface = IPv4Interface( ( ipParse( address ), prefix if slash else 24 ) )
+    return int( interface.ip ), interface.network.prefixlen
 
 def checkInt( s ):
     "Check if input string is an int"
